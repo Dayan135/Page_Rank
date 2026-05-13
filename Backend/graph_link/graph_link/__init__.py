@@ -209,7 +209,8 @@ def normalize_transition_matrix(A_csr: sp.csr_matrix) -> sp.csr_matrix:
     A = A_csr.tocsc().astype(np.float32)
     col_sums = np.asarray(A.sum(axis=0), dtype=np.float32).ravel()
 
-    inv = np.where(col_sums > 0, 1.0 / col_sums, 0.0).astype(np.float32)
+    inv = np.zeros_like(col_sums)
+    np.divide(1.0, col_sums, out=inv, where=col_sums > 0)
     A_norm = A.multiply(inv).tocsr()
 
     dangling = np.where(col_sums == 0)[0]
