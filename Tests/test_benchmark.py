@@ -57,28 +57,84 @@ class TestBenchmarkPPRGPU:
         return np.random.randint(0, system_size, size=features).astype(np.int32)
 
     # =========================================================================
-    # 1. Torch cuSPARSE Baseline (GPU - Native PyTorch)
+    # 1a. Torch cuSPARSE — fixed iterations, no convergence check
+    #     (pure SpMM throughput; single sync at the end)
     # =========================================================================
     def test_benchmark_torch_ppr(self, transition_matrices, source_nodes, system_size, features, alpha, max_iterations, benchmark):
         _, A_torch = transition_matrices
         source_tensor = torch.tensor(source_nodes, dtype=torch.int64, device='cuda')
+        feat_idx = torch.arange(features, device='cuda')
 
         @torch.no_grad()
         def runner():
             X = torch.zeros((system_size, features), device='cuda')
-            X[source_tensor, torch.arange(features, device='cuda')] = 1.0
+            X[source_tensor, feat_idx] = 1.0
 
             for _ in range(max_iterations):
                 Y = torch.sparse.mm(A_torch, X)
                 X = alpha * Y
-                X[source_tensor, torch.arange(features, device='cuda')] += (1.0 - alpha)
+                X[source_tensor, feat_idx] += (1.0 - alpha)
 
             torch.cuda.synchronize()
 
         benchmark.pedantic(runner, rounds=20, warmup_rounds=5)
 
     # =========================================================================
-    # 2. The Challenger: PBR Batched Engine (GPU - Custom CUDA)
+    # 1b. Torch cuSPARSE — with per-iteration convergence check
+    #     (fair comparison for test_benchmark_pbr_engine below)
+    # =========================================================================
+    def test_benchmark_torch_ppr_with_convergence(self, transition_matrices, source_nodes, system_size, features, alpha, max_iterations, tolerance, benchmark):
+        _, A_torch = transition_matrices
+        source_tensor = torch.tensor(source_nodes, dtype=torch.int64, device='cuda')
+        feat_idx = torch.arange(features, device='cuda')
+
+        @torch.no_grad()
+        def runner():
+            X = torch.zeros((system_size, features), device='cuda')
+            X[source_tensor, feat_idx] = 1.0
+
+            for _ in range(max_iterations):
+                Y = torch.sparse.mm(A_torch, X)
+                new_X = alpha * Y
+                new_X[source_tensor, feat_idx] += (1.0 - alpha)
+                errors = (new_X - X).abs().sum(dim=0)  # per-feature L1 error
+                X = new_X
+                if errors.max().item() < tolerance:
+                    break
+
+            torch.cuda.synchronize()
+
+        benchmark.pedantic(runner, rounds=20, warmup_rounds=5)
+
+    # =========================================================================
+    # 2a. PBR Engine — fixed iterations, no convergence check
+    #     (apples-to-apples vs test_benchmark_torch_ppr)
+    # =========================================================================
+    @mark.parametrize('block_size', [2, 4])
+    def test_benchmark_pbr_fixed_iters(self, transition_matrices, source_nodes, system_size, features, alpha, max_iterations, block_size, benchmark):
+        A_norm, _ = transition_matrices
+        pbr_mat_obj = graph_link.csr_to_pbr(A_norm, block_rows=block_size, block_cols=block_size, min_nnz_per_block=1)
+        pbr_device = pbr_mat_obj.to('cuda')
+        source_tensor = torch.tensor(source_nodes, dtype=torch.int64, device='cuda')
+        feat_idx = torch.arange(features, device='cuda')
+
+        @torch.no_grad()
+        def runner():
+            X = torch.zeros((system_size, features), dtype=torch.float32, device='cuda')
+            X[source_tensor, feat_idx] = 1.0
+
+            for _ in range(max_iterations):
+                Y = graph_link.pbr_matmul(pbr_device, X)
+                X = alpha * Y
+                X[source_tensor, feat_idx] += (1.0 - alpha)
+
+            torch.cuda.synchronize()
+
+        benchmark.pedantic(runner, rounds=20, warmup_rounds=5)
+
+    # =========================================================================
+    # 2b. PBR Engine — full PPR with per-iteration convergence check
+    #     (apples-to-apples vs test_benchmark_torch_ppr_with_convergence)
     # =========================================================================
     @mark.parametrize('block_size', [2, 4])
     def test_benchmark_pbr_engine(self, transition_matrices, source_nodes, system_size, features, alpha, max_iterations, tolerance, block_size, benchmark):

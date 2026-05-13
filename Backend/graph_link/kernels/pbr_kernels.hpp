@@ -51,7 +51,8 @@ void launch_ppr_update_normalized(
     scalar_t alpha,
     int N,
     int features,
-    scalar_t* errors
+    scalar_t* errors,
+    cudaStream_t stream = 0
 );
 
 template <typename scalar_t>

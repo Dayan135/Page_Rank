@@ -156,44 +156,34 @@ void launch_pbr_spmm(
     const int cols,
     const int rows,
     const int runtime_block_rows,
-    const int runtime_block_cols, 
+    const int runtime_block_cols,
     const uint64_t* block_codes,
     const index_t* block_coords,
     const index_t* block_offsets,
     const scalar_t* block_data,
     const scalar_t* X,
-    scalar_t* Y
-) { 
-    // Fast exit for perfectly empty matrices
-    if (num_pbr_blocks == 0) {
-        return; // Y is already allocated with zeros, just return it!
-    }
-    
-    // Z-dimension: How many blocks of 512 features do we need?
+    scalar_t* Y,
+    cudaStream_t stream
+) {
+    if (num_pbr_blocks == 0) return;
+
     int feat_blocks = (features + FEAT_BLOCK_SIZE - 1) / FEAT_BLOCK_SIZE;
-    
-    // X = Number of PBR blocks
-    // Y = Batch size
-    // Z = Feature chunking
     dim3 grid(num_pbr_blocks, batch_size, feat_blocks);
     dim3 block(THREADS_PER_BLOCK);
 
-    // 2. Dispatcher: Route to the statically unrolled template based on runtime vars
-    // (Note: No dynamic shared memory size parameter is passed in the <<< >>> because 
-    // the kernel uses a statically sized __shared__ scalar_t smem[TOTAL_SHARED])
     if (runtime_block_rows == 2 && runtime_block_cols == 2) {
-        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 2, 2><<<grid, block>>>(
-            num_pbr_blocks, features, batch_size, cols, rows, 
+        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 2, 2><<<grid, block, 0, stream>>>(
+            num_pbr_blocks, features, batch_size, cols, rows,
             block_codes, block_coords, block_offsets, block_data, X, Y
         );
     } else if (runtime_block_rows == 4 && runtime_block_cols == 4) {
-        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 4, 4><<<grid, block>>>(
-            num_pbr_blocks, features, batch_size, cols, rows, 
+        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 4, 4><<<grid, block, 0, stream>>>(
+            num_pbr_blocks, features, batch_size, cols, rows,
             block_codes, block_coords, block_offsets, block_data, X, Y
         );
     } else if (runtime_block_rows == 8 && runtime_block_cols == 8) {
-        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 8, 8><<<grid, block>>>(
-            num_pbr_blocks, features, batch_size, cols, rows, 
+        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 8, 8><<<grid, block, 0, stream>>>(
+            num_pbr_blocks, features, batch_size, cols, rows,
             block_codes, block_coords, block_offsets, block_data, X, Y
         );
     } else {
@@ -349,57 +339,57 @@ void launch_ppr_update(const scalar_t* Y, const scalar_t* curr_X, scalar_t* next
 }
 
 // PPR update for column-stochastic A: X = alpha*Y + (1-alpha)*e_s  (in-place, no col_sums needed)
-// Also accumulates per-feature L1 convergence error in shared memory.
+//
+// 2D grid — no integer division in hot path:
+//   blockIdx.x  → feature tile  (threads cover a contiguous slice of features)
+//   blockIdx.y  → node stripe   (stride loop over N)
+//   threadIdx.x → feature within tile
+//
+// Each thread accumulates its feature's L1 error in a register, then does one
+// atomicAdd to global errors[] — no shared memory needed.
 template <typename scalar_t>
 __global__ void ppr_update_normalized_kernel(
     const scalar_t* __restrict__ Y,
-    scalar_t*       __restrict__ X,          // updated in-place
+    scalar_t*       __restrict__ X,
     const int*      __restrict__ source_nodes,
     scalar_t alpha,
     int N,
     int features,
     scalar_t* __restrict__ errors
 ) {
-    extern __shared__ char smem[];
-    scalar_t* s_errors = reinterpret_cast<scalar_t*>(smem);
+    const int feat = blockIdx.x * blockDim.x + threadIdx.x;
+    if (feat >= features) return;
 
-    for (int f = threadIdx.x; f < features; f += blockDim.x)
-        s_errors[f] = static_cast<scalar_t>(0);
-    __syncthreads();
+    const int   src        = source_nodes[feat];
+    const scalar_t compl_  = static_cast<scalar_t>(1) - alpha;
+    scalar_t feat_error    = static_cast<scalar_t>(0);
 
-    const scalar_t complement = static_cast<scalar_t>(1) - alpha;
-    const int stride = blockDim.x * gridDim.x;
-
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N * features; i += stride) {
-        const int node = i / features;
-        const int feat = i % features;
-
-        scalar_t new_val = alpha * Y[i];
-        if (node == source_nodes[feat])
-            new_val += complement;
-
-        scalar_t diff = new_val - X[i];
-        diff = diff < static_cast<scalar_t>(0) ? -diff : diff;
-        atomicAdd(&s_errors[feat], diff);
-        X[i] = new_val;
+    for (int node = blockIdx.y; node < N; node += gridDim.y) {
+        const int idx      = node * features + feat;
+        scalar_t  new_val  = alpha * Y[idx];
+        if (node == src)   new_val += compl_;
+        scalar_t  diff     = new_val - X[idx];
+        feat_error        += (diff >= static_cast<scalar_t>(0) ? diff : -diff);
+        X[idx]             = new_val;
     }
-    __syncthreads();
 
-    for (int f = threadIdx.x; f < features; f += blockDim.x)
-        if (s_errors[f] > static_cast<scalar_t>(0))
-            atomicAdd(&errors[f], s_errors[f]);
+    atomicAdd(&errors[feat], feat_error);
 }
 
 template <typename scalar_t>
 void launch_ppr_update_normalized(
     const scalar_t* Y, scalar_t* X, const int* source_nodes,
-    scalar_t alpha, int N, int features, scalar_t* errors
+    scalar_t alpha, int N, int features, scalar_t* errors,
+    cudaStream_t stream
 ) {
-    const int threads = 256;
-    const int blocks  = std::min(1024, (N * features + threads - 1) / threads);
-    const int smem    = features * sizeof(scalar_t);
-    cudaMemsetAsync(errors, 0, features * sizeof(scalar_t));
-    ppr_update_normalized_kernel<scalar_t><<<blocks, threads, smem>>>(
+    cudaMemsetAsync(errors, 0, features * sizeof(scalar_t), stream);
+
+    const int feat_threads = 128;
+    const int feat_blocks  = (features + feat_threads - 1) / feat_threads;
+    const int node_stripes = std::min(N, 1024);
+
+    dim3 grid(feat_blocks, node_stripes);
+    ppr_update_normalized_kernel<scalar_t><<<grid, feat_threads, 0, stream>>>(
         Y, X, source_nodes, alpha, N, features, errors
     );
 }
@@ -449,8 +439,8 @@ template void launch_pbr_spmm<int64_t, double>(const int, const int, const int, 
 template void launch_coo_spmm<float> (int, int, int, int, int, const int32_t*, const int32_t*, const float*,  const float*,  float*,  cudaStream_t);
 template void launch_coo_spmm<double>(int, int, int, int, int, const int32_t*, const int32_t*, const double*, const double*, double*, cudaStream_t);
 
-template void launch_ppr_update_normalized<float> (const float*,  float*,  const int*, float,  int, int, float*);
-template void launch_ppr_update_normalized<double>(const double*, double*, const int*, double, int, int, double*);
+template void launch_ppr_update_normalized<float> (const float*,  float*,  const int*, float,  int, int, float*,  cudaStream_t);
+template void launch_ppr_update_normalized<double>(const double*, double*, const int*, double, int, int, double*, cudaStream_t);
 
 // Missing Mass Kernel
 template __global__ void batched_missing_mass_kernel<float>(const float*, float*, int, int);
