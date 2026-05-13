@@ -4,6 +4,7 @@
 #include <ATen/SparseCsrTensorUtils.h>
 
 #include "../kernels/pbr_kernels.hpp"
+#include "../kernels/ppr_kernels.hpp"
 
 // Combined SpMM wrapper: launches the block kernel and the COO remainder kernel
 // on two independent CUDA streams so they can overlap on the GPU.
