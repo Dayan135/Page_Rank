@@ -458,6 +458,31 @@ pbr_matrix_t<index_t, scalar_t> csr_to_pbr(const py::array_t<index_t, py::array:
         }
     }
 
+    // Flush the last partial stripe when rows % block_rows != 0
+    for (const auto& [block_index, code] : stripe_block_codes) {
+        int nnz_in_block = count_set_bits(code);
+        if (count_set_bits(code) >= min_nnz_per_block) {
+            block_codes.emplace_back(code);
+            block_coords.emplace_back(std::move(stripe_block_coords[block_index]));
+            block_data.insert(block_data.end(), make_move_iterator(stripe_block_data[block_index].begin()),
+                                                make_move_iterator(stripe_block_data[block_index].end()));
+            current_offset += nnz_in_block;
+            block_offsets.push_back(current_offset);
+        } else {
+            index_t block_nnz_index = 0;
+            for (index_t row_offset = 0; row_offset < block_rows; ++row_offset) {
+                for (index_t col_offset = 0; col_offset < block_cols; ++col_offset) {
+                    if (is_bit_set(code, row_offset * block_cols + col_offset)) {
+                        const auto [block_row, block_col] = stripe_block_coords[block_index];
+                        remainder_coo.emplace_back(block_row + row_offset, block_col + col_offset,
+                                                   stripe_block_data[block_index][block_nnz_index]);
+                        ++block_nnz_index;
+                    }
+                }
+            }
+        }
+    }
+
     return pbr_matrix_t<index_t, scalar_t>(rows, cols, block_rows, block_cols, total_nnz,
                                            std::move(block_codes), std::move(block_coords),
                                            std::move(block_offsets),
