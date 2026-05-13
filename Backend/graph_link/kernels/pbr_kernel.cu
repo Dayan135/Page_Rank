@@ -148,6 +148,35 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_zero_idle_kern
 }
 
 
+template <typename scalar_t>
+__global__ void coo_spmm_kernel(
+    int nnz,
+    int features,
+    int batch_size,
+    int cols,
+    int rows,
+    const int32_t* __restrict__ coo_rows,
+    const int32_t* __restrict__ coo_cols,
+    const scalar_t* __restrict__ coo_vals,
+    const scalar_t* __restrict__ X,
+    scalar_t* __restrict__ Y
+) {
+    const int nnz_idx   = blockIdx.x;
+    const int batch_idx = blockIdx.y;
+    const int feat      = blockIdx.z * blockDim.x + threadIdx.x;
+    if (feat >= features) return;
+
+    const int32_t row  = coo_rows[nnz_idx];
+    const int32_t col  = coo_cols[nnz_idx];
+    const scalar_t val = coo_vals[nnz_idx];
+
+    atomicAdd(
+        &Y[(batch_idx * rows * features) + (row * features) + feat],
+        val * X[(batch_idx * cols * features) + (col * features) + feat]
+    );
+}
+
+
 template <typename index_t, typename scalar_t>
 void launch_pbr_spmm(
     const int num_pbr_blocks,
@@ -162,7 +191,8 @@ void launch_pbr_spmm(
     const index_t* block_offsets,
     const scalar_t* block_data,
     const scalar_t* X,
-    scalar_t* Y
+    scalar_t* Y,
+    cudaStream_t stream
 ) {
     // Fast exit for perfectly empty matrices
     if (num_pbr_blocks == 0) {
@@ -182,17 +212,17 @@ void launch_pbr_spmm(
     // (Note: No dynamic shared memory size parameter is passed in the <<< >>> because
     // the kernel uses a statically sized __shared__ scalar_t smem[TOTAL_SHARED])
     if (runtime_block_rows == 2 && runtime_block_cols == 2) {
-        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 2, 2><<<grid, block>>>(
+        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 2, 2><<<grid, block, 0, stream>>>(
             num_pbr_blocks, features, batch_size, cols, rows,
             block_codes, block_coords, block_offsets, block_data, X, Y
         );
     } else if (runtime_block_rows == 4 && runtime_block_cols == 4) {
-        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 4, 4><<<grid, block>>>(
+        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 4, 4><<<grid, block, 0, stream>>>(
             num_pbr_blocks, features, batch_size, cols, rows,
             block_codes, block_coords, block_offsets, block_data, X, Y
         );
     } else if (runtime_block_rows == 8 && runtime_block_cols == 8) {
-        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 8, 8><<<grid, block>>>(
+        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 8, 8><<<grid, block, 0, stream>>>(
             num_pbr_blocks, features, batch_size, cols, rows,
             block_codes, block_coords, block_offsets, block_data, X, Y
         );

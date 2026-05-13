@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cuda_runtime.h>
+#include "ppr_kernels.hpp"
 
 template <typename index_t, typename scalar_t>
 void launch_pbr_spmm(
