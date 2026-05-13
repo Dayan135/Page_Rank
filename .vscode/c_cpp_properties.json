@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/Backend/hpc_core",
+                "/home/dayanb/.conda/envs/pageRank/include",
+                "/home/dayanb/.conda/envs/pageRank/include/python3.14",
+                "/usr/local/cuda/include"
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c17",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "includePath": [
+        "${workspaceFolder}/**",
+        "/usr/local/cuda/include" 
+    ],
+    "version": 4
+}
