@@ -114,6 +114,7 @@ void launch_pbr_spmm(
     scalar_t* Y,
     cudaStream_t stream
 ) {
+    if (num_pbr_blocks == 0) return;
     int threads_per_block = THREADS_PER_BLOCK_VER3;
     dim3 grid(num_pbr_blocks, batch_size, (features + threads_per_block - 1) / threads_per_block);
     dim3 block(threads_per_block);
