@@ -59,6 +59,22 @@ void pbr_full_spmm_cuda_wrapper(
     cudaStreamDestroy(s_coo);
 }
 
+// PPR update for column-stochastic A (in-place, no col_sums)
+template <typename scalar_t>
+void ppr_update_normalized_wrapper(
+    at::Tensor Y, at::Tensor X, at::Tensor source_nodes,
+    double alpha, int N, int features, at::Tensor errors
+) {
+    launch_ppr_update_normalized<scalar_t>(
+        Y.data_ptr<scalar_t>(),
+        X.data_ptr<scalar_t>(),
+        source_nodes.data_ptr<int32_t>(),
+        static_cast<scalar_t>(alpha),
+        N, features,
+        errors.data_ptr<scalar_t>()
+    );
+}
+
 // 1. Init PPR Wrapper
 template <typename scalar_t>
 void init_ppr_cuda_wrapper(at::Tensor X, at::Tensor source_nodes, int N, int features) {
@@ -112,7 +128,11 @@ void bind_cuda_functions(py::module_& m) {
     m.def("missing_mass_cuda_float", &missing_mass_cuda_wrapper<float>);
     m.def("missing_mass_cuda_double", &missing_mass_cuda_wrapper<double>);
     
-    // PPR Update
-    m.def("ppr_update_cuda_float", &ppr_update_cuda_wrapper<float>);
+    // PPR Update (legacy: handles non-normalized A via col_sums)
+    m.def("ppr_update_cuda_float",  &ppr_update_cuda_wrapper<float>);
     m.def("ppr_update_cuda_double", &ppr_update_cuda_wrapper<double>);
+
+    // PPR Update (normalized A: no col_sums, in-place)
+    m.def("ppr_update_normalized_cuda_float",  &ppr_update_normalized_wrapper<float>);
+    m.def("ppr_update_normalized_cuda_double", &ppr_update_normalized_wrapper<double>);
 }

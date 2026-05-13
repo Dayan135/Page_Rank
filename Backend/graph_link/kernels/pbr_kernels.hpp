@@ -44,6 +44,17 @@ __global__ void batched_missing_mass_kernel(
 );
 
 template <typename scalar_t>
+void launch_ppr_update_normalized(
+    const scalar_t* Y,
+    scalar_t* X,
+    const int* source_nodes,
+    scalar_t alpha,
+    int N,
+    int features,
+    scalar_t* errors
+);
+
+template <typename scalar_t>
 void launch_init_ppr(scalar_t* X, const int* source_nodes, int N, int features);
 
 template <typename scalar_t>

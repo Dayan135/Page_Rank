@@ -1,3 +1,4 @@
+import numpy as np
 import scipy.sparse as sp
 import torch
 import graph_link_core as core
@@ -196,76 +197,86 @@ def pbr_analyze_csr(mat: sp.csr_matrix | torch.Tensor,
         raise TypeError(f'Unsupported type {type(mat)}')
     
     
-def run_personalized_pagerank(pbr_mat, source_nodes: torch.Tensor, damping_factor: float = 0.85, max_iterations: int = 100, tolerance: float = 1e-6):
+def normalize_transition_matrix(A_csr: sp.csr_matrix) -> sp.csr_matrix:
     """
-    Runs Batched Personalized PageRank entirely on the GPU using PyTorch tensors 
-    and custom CUDA kernels.
+    Returns a column-stochastic transition matrix suitable for PPR.
+
+    Each column is divided by its out-degree (column sum).
+    Dangling nodes (zero out-degree) receive a uniform 1/N column so
+    the matrix stays column-stochastic, conserving probability mass.
     """
-    # 1. Setup & Validation
+    N = A_csr.shape[0]
+    A = A_csr.tocsc().astype(np.float32)
+    col_sums = np.asarray(A.sum(axis=0), dtype=np.float32).ravel()
+
+    inv = np.where(col_sums > 0, 1.0 / col_sums, 0.0).astype(np.float32)
+    A_norm = A.multiply(inv).tocsr()
+
+    dangling = np.where(col_sums == 0)[0]
+    if dangling.size > 0:
+        r = np.tile(np.arange(N, dtype=np.int32), dangling.size)
+        c = np.repeat(dangling.astype(np.int32), N)
+        v = np.full(N * dangling.size, 1.0 / N, dtype=np.float32)
+        A_norm = A_norm + sp.csr_matrix((v, (r, c)), shape=(N, N))
+
+    return A_norm
+
+
+def run_personalized_pagerank(
+    pbr_mat,
+    source_nodes: torch.Tensor,
+    alpha: float = 0.85,
+    max_iterations: int = 100,
+    tolerance: float = 1e-6,
+):
+    """
+    Batched Personalized PageRank via power iteration:
+
+        X_{t+1} = alpha * A @ X_t + (1 - alpha) * e_s
+
+    pbr_mat must be on GPU and built from a column-stochastic matrix
+    (use normalize_transition_matrix() to prepare the adjacency matrix).
+
+    Returns (X, iterations_run, converged).
+    """
     meta = get_pbr_gpu_meta(pbr_mat)
     if meta is None:
         raise RuntimeError("PBRMatrix is not on GPU. Call .to('cuda') first.")
-    
+
     if source_nodes.dtype != torch.int32:
         source_nodes = source_nodes.to(torch.int32)
-        
+
     device = source_nodes.device
-    N = pbr_mat.rows
-    features = source_nodes.shape[0]
-    batch_size = 1
-    dtype = meta['data'].dtype
-    
-    # 2. Allocate GPU Tensors via PyTorch
-    X_curr = torch.zeros((N, features), dtype=dtype, device=device)
-    X_next = torch.zeros((N, features), dtype=dtype, device=device)
-    Y = torch.zeros((N, features), dtype=dtype, device=device)
-    col_sums = torch.zeros(features, dtype=dtype, device=device)
-    errors = torch.zeros(features, dtype=dtype, device=device)
+    N      = pbr_mat.rows
+    K      = source_nodes.shape[0]
+    dtype  = meta['data'].dtype
 
-    # Select the correct dtype kernels
+    # Single X buffer (updated in-place), one Y buffer for SpMM output.
+    X      = torch.zeros((N, K), dtype=dtype, device=device)
+    Y      = torch.zeros((N, K), dtype=dtype, device=device)
+    errors = torch.zeros(K,      dtype=dtype, device=device)
+
     if dtype == torch.float32:
-        init_kernel = core.init_ppr_cuda_float
-        missing_mass_kernel = core.missing_mass_cuda_float
-        update_kernel = core.ppr_update_cuda_float
+        init_fn   = core.init_ppr_cuda_float
+        update_fn = core.ppr_update_normalized_cuda_float
     else:
-        init_kernel = core.init_ppr_cuda_double
-        missing_mass_kernel = core.missing_mass_cuda_double
-        update_kernel = core.ppr_update_cuda_double
+        init_fn   = core.init_ppr_cuda_double
+        update_fn = core.ppr_update_normalized_cuda_double
 
-    # 3. Initialization
-    init_kernel(X_curr, source_nodes, N, features)
+    init_fn(X, source_nodes, N, K)
 
-    # 4. The Master GPU Loop
-    for i in range(max_iterations):
-        Y.zero_() # Important: SpMM uses atomicAdd, must be zeroed!
-        
-        # Step A: Multiply (A * X_curr = Y)
-        pbr_batched_matmul_cuda(pbr_mat, X_curr, Y, batch_size, features)
-        
-        # Step B: Find Sinkhole Mass
-        missing_mass_kernel(Y, col_sums, N, features)
-        
-        # Step C: Apply Damping & Teleport back to source nodes
-        errors.zero_()
-        update_kernel(Y, X_curr, X_next, source_nodes, col_sums, damping_factor, N, features, errors)
-        
-        # Step D: Convergence Check
-        # Check if the maximum error in the batch is below the tolerance
-        # if errors.max().item() < tolerance:
-        #     return X_next, i + 1, True
-            
-        # Step E: Swap Pointers (zero-copy)
-        X_curr, X_next = X_next, X_curr
+    for t in range(max_iterations):
+        Y.zero_()                                          # clear for atomicAdd
+        pbr_batched_matmul_cuda(pbr_mat, X, Y, 1, K)      # Y = A @ X
+        update_fn(Y, X, source_nodes, alpha, N, K, errors) # X = alpha*Y + (1-alpha)*e_s
 
-    return X_curr, max_iterations, False
+        if errors.max().item() < tolerance:
+            return X, t + 1, True
+
+    return X, max_iterations, False
 
 
 __all__ = [
-    # 'spdmm_csc_naive',
-    # 'spdmm_csc_shared_mem',
-    # 'spdmm_csr_naive',
-    # 'spdmm_csr_shared_mem',
-
     'csr_to_pbr',
     'pbr_to_csr',
     'pbr_analyze_csr',
@@ -274,6 +285,6 @@ __all__ = [
     'pbr_batched_matmul_triton_gpu',
     'pbr_batched_matmul_cuda',
     'get_pbr_gpu_meta',
-    'run_personalized_pagerank'
-
+    'normalize_transition_matrix',
+    'run_personalized_pagerank',
 ]

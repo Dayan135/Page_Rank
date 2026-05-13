@@ -316,6 +316,62 @@ void launch_ppr_update(const scalar_t* Y, const scalar_t* curr_X, scalar_t* next
     );
 }
 
+// PPR update for column-stochastic A: X = alpha*Y + (1-alpha)*e_s  (in-place, no col_sums needed)
+// Also accumulates per-feature L1 convergence error in shared memory.
+template <typename scalar_t>
+__global__ void ppr_update_normalized_kernel(
+    const scalar_t* __restrict__ Y,
+    scalar_t*       __restrict__ X,          // updated in-place
+    const int*      __restrict__ source_nodes,
+    scalar_t alpha,
+    int N,
+    int features,
+    scalar_t* __restrict__ errors
+) {
+    extern __shared__ char smem[];
+    scalar_t* s_errors = reinterpret_cast<scalar_t*>(smem);
+
+    for (int f = threadIdx.x; f < features; f += blockDim.x)
+        s_errors[f] = static_cast<scalar_t>(0);
+    __syncthreads();
+
+    const scalar_t complement = static_cast<scalar_t>(1) - alpha;
+    const int stride = blockDim.x * gridDim.x;
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N * features; i += stride) {
+        const int node = i / features;
+        const int feat = i % features;
+
+        scalar_t new_val = alpha * Y[i];
+        if (node == source_nodes[feat])
+            new_val += complement;
+
+        scalar_t diff = new_val - X[i];
+        diff = diff < static_cast<scalar_t>(0) ? -diff : diff;
+        atomicAdd(&s_errors[feat], diff);
+        X[i] = new_val;
+    }
+    __syncthreads();
+
+    for (int f = threadIdx.x; f < features; f += blockDim.x)
+        if (s_errors[f] > static_cast<scalar_t>(0))
+            atomicAdd(&errors[f], s_errors[f]);
+}
+
+template <typename scalar_t>
+void launch_ppr_update_normalized(
+    const scalar_t* Y, scalar_t* X, const int* source_nodes,
+    scalar_t alpha, int N, int features, scalar_t* errors
+) {
+    const int threads = 256;
+    const int blocks  = std::min(1024, (N * features + threads - 1) / threads);
+    const int smem    = features * sizeof(scalar_t);
+    cudaMemsetAsync(errors, 0, features * sizeof(scalar_t));
+    ppr_update_normalized_kernel<scalar_t><<<blocks, threads, smem>>>(
+        Y, X, source_nodes, alpha, N, features, errors
+    );
+}
+
 // Kernel: Sets the source node for each feature to 1.0, everything else is 0.0 (done via cudaMemset)
 template <typename scalar_t>
 __global__ void init_ppr_sources_kernel(
@@ -360,6 +416,9 @@ template void launch_pbr_spmm<int64_t, double>(const int, const int, const int, 
 
 template void launch_coo_spmm<float> (int, int, int, int, int, const int32_t*, const int32_t*, const float*,  const float*,  float*,  cudaStream_t);
 template void launch_coo_spmm<double>(int, int, int, int, int, const int32_t*, const int32_t*, const double*, const double*, double*, cudaStream_t);
+
+template void launch_ppr_update_normalized<float> (const float*,  float*,  const int*, float,  int, int, float*);
+template void launch_ppr_update_normalized<double>(const double*, double*, const int*, double, int, int, double*);
 
 // Missing Mass Kernel
 template __global__ void batched_missing_mass_kernel<float>(const float*, float*, int, int);

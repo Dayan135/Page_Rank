@@ -142,8 +142,14 @@ Unified entry point. Dispatches to GPU path (via `pbr_batched_matmul_cuda`) or C
 ### `pbr_batched_matmul_cuda(pbr_mat, x, y, batch_size, features)`
 Dispatches to the correct `core.pbr_full_spmm_cuda_*` variant based on `meta['coords'].dtype` and `meta['data'].dtype`. Passes both the block and remainder tensors.
 
-### `run_personalized_pagerank(pbr_mat, source_nodes, damping=0.85, max_iter=100, tol=1e-6)`
-Full GPU loop: `init → (SpMM → missing_mass → ppr_update) × N`. Requires `pbr_mat.to('cuda')` first.
+### `normalize_transition_matrix(A_csr) → sp.csr_matrix`
+Column-normalizes A for PPR. Non-zero columns divided by their sum. Dangling columns (sum=0) get uniform 1/N. Call this before `csr_to_pbr` when using `run_personalized_pagerank`.
+
+### `run_personalized_pagerank(pbr_mat, source_nodes, alpha=0.85, max_iterations=100, tolerance=1e-6)`
+Power-iteration PPR: **X_{t+1} = α · A @ X_t + (1−α) · e_s**
+- Requires `pbr_mat.to('cuda')` and a column-stochastic matrix (use `normalize_transition_matrix` first)
+- Per iteration: `Y.zero_()` → SpMM → `ppr_update_normalized` (in-place, no col_sums, no missing_mass)
+- Early exit when `max(errors) < tolerance`; returns `(X, iterations_run, converged)`
 
 ---
 
