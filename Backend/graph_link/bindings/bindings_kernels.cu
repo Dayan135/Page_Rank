@@ -5,21 +5,30 @@
 
 #include "../kernels/pbr_kernels.hpp"
 
-// The Bridge: Converts PyTorch ATen GPU tensors into raw C++ pointers for your CUDA kernel
+// Combined SpMM wrapper: launches the block kernel and the COO remainder kernel
+// on two independent CUDA streams so they can overlap on the GPU.
 template <typename index_t, typename scalar_t>
-void pbr_spmm_cuda_wrapper(
+void pbr_full_spmm_cuda_wrapper(
     int num_pbr_blocks, int features, int batch_size, int cols, int rows,
     int BLOCK_ROWS, int BLOCK_COLS,
     at::Tensor block_codes,
     at::Tensor block_coords,
     at::Tensor block_offsets,
     at::Tensor block_data,
+    int rem_nnz,
+    at::Tensor rem_rows,
+    at::Tensor rem_cols,
+    at::Tensor rem_vals,
     at::Tensor X,
     at::Tensor Y
 ) {
-    // PyTorch doesn't have an explicit uint64 tensor type, so we use int64 in Python
-    // and safely cast the raw memory pointer to uint64_t* for the bitwise CUDA math.
+    cudaStream_t s_blocks, s_coo;
+    cudaStreamCreate(&s_blocks);
+    cudaStreamCreate(&s_coo);
+
+    // PyTorch stores block_codes as int64; reinterpret as uint64 for bitwise ops.
     const uint64_t* codes_ptr = reinterpret_cast<const uint64_t*>(block_codes.data_ptr<int64_t>());
+
     launch_pbr_spmm<index_t, scalar_t>(
         num_pbr_blocks, features, batch_size, cols, rows, BLOCK_ROWS, BLOCK_COLS,
         codes_ptr,
@@ -27,8 +36,27 @@ void pbr_spmm_cuda_wrapper(
         block_offsets.data_ptr<index_t>(),
         block_data.data_ptr<scalar_t>(),
         X.data_ptr<scalar_t>(),
-        Y.data_ptr<scalar_t>()
+        Y.data_ptr<scalar_t>(),
+        s_blocks
     );
+
+    if (rem_nnz > 0) {
+        launch_coo_spmm<scalar_t>(
+            rem_nnz, features, batch_size, cols, rows,
+            rem_rows.data_ptr<int32_t>(),
+            rem_cols.data_ptr<int32_t>(),
+            rem_vals.data_ptr<scalar_t>(),
+            X.data_ptr<scalar_t>(),
+            Y.data_ptr<scalar_t>(),
+            s_coo
+        );
+    }
+
+    cudaStreamSynchronize(s_blocks);
+    if (rem_nnz > 0) cudaStreamSynchronize(s_coo);
+
+    cudaStreamDestroy(s_blocks);
+    cudaStreamDestroy(s_coo);
 }
 
 // 1. Init PPR Wrapper
@@ -71,10 +99,10 @@ void ppr_update_cuda_wrapper(
 }
 
 void bind_cuda_functions(py::module_& m) {
-    m.def("pbr_spmm_cuda_int32_float", &pbr_spmm_cuda_wrapper<int32_t, float>);
-    m.def("pbr_spmm_cuda_int64_float", &pbr_spmm_cuda_wrapper<int64_t, float>);
-    m.def("pbr_spmm_cuda_int32_double", &pbr_spmm_cuda_wrapper<int32_t, double>);
-    m.def("pbr_spmm_cuda_int64_double", &pbr_spmm_cuda_wrapper<int64_t, double>);
+    m.def("pbr_full_spmm_cuda_int32_float",  &pbr_full_spmm_cuda_wrapper<int32_t, float>);
+    m.def("pbr_full_spmm_cuda_int64_float",  &pbr_full_spmm_cuda_wrapper<int64_t, float>);
+    m.def("pbr_full_spmm_cuda_int32_double", &pbr_full_spmm_cuda_wrapper<int32_t, double>);
+    m.def("pbr_full_spmm_cuda_int64_double", &pbr_full_spmm_cuda_wrapper<int64_t, double>);
     
     // Init PPR
     m.def("init_ppr_cuda_float", &init_ppr_cuda_wrapper<float>);

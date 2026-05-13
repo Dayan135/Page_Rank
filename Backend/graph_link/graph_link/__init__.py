@@ -39,10 +39,13 @@ def _pbr_to_method(self, device='cuda'):
     if target_device != 'cpu':
         meta = self.to_dict()
         gpu_meta = {
-            'codes': torch.as_tensor(meta['block_codes'], device=device, dtype=torch.int64),
-            'coords': torch.as_tensor(meta['block_coords'], device=device, dtype=torch.int32),
-            'offsets': torch.as_tensor(meta['block_offsets'], device=device, dtype=torch.int32),
-            'data': torch.as_tensor(meta['block_data'], device=device)
+            'codes':    torch.as_tensor(meta['block_codes'],   device=device, dtype=torch.int64),
+            'coords':   torch.as_tensor(meta['block_coords'],  device=device, dtype=torch.int32),
+            'offsets':  torch.as_tensor(meta['block_offsets'], device=device, dtype=torch.int32),
+            'data':     torch.as_tensor(meta['block_data'],    device=device),
+            'rem_rows': torch.as_tensor(meta['rem_rows'],      device=device, dtype=torch.int32),
+            'rem_cols': torch.as_tensor(meta['rem_cols'],      device=device, dtype=torch.int32),
+            'rem_vals': torch.as_tensor(meta['rem_vals'],      device=device),
         }
         
         # Register the GPU tensors under the new object's ID
@@ -60,25 +63,24 @@ for cls_name in ["PBRMatrixInt64Float", "PBRMatrixInt32Float",
     
 def pbr_batched_matmul_cuda(pbr_mat, x: torch.Tensor, y: torch.Tensor, batch_size: int, features: int):
     """
-    Python wrapper that routes the GPU tensors to the correct PyBind11 CUDA function.
+    Launches block SpMM and COO remainder SpMM on two CUDA streams in parallel,
+    then synchronizes via the combined C++ wrapper.
     """
     meta = get_pbr_gpu_meta(pbr_mat)
     if meta is None:
         raise RuntimeError("PBRMatrix is not on GPU. Call .to('cuda') first.")
     index_dtype = meta['coords'].dtype
-    data_dtype = meta['data'].dtype
-    # Dispatch to the correct C++ template instantiation
+    data_dtype  = meta['data'].dtype
     if index_dtype == torch.int32 and data_dtype == torch.float32:
-        kernel_func = core.pbr_spmm_cuda_int32_float
+        kernel_func = core.pbr_full_spmm_cuda_int32_float
     elif index_dtype == torch.int64 and data_dtype == torch.float32:
-        kernel_func = core.pbr_spmm_cuda_int64_float
+        kernel_func = core.pbr_full_spmm_cuda_int64_float
     elif index_dtype == torch.int32 and data_dtype == torch.float64:
-        kernel_func = core.pbr_spmm_cuda_int32_double
+        kernel_func = core.pbr_full_spmm_cuda_int32_double
     elif index_dtype == torch.int64 and data_dtype == torch.float64:
-        kernel_func = core.pbr_spmm_cuda_int64_double
+        kernel_func = core.pbr_full_spmm_cuda_int64_double
     else:
         raise TypeError(f"Unsupported dtype combination: index={index_dtype}, data={data_dtype}")
-    # Fire the raw CUDA kernel via PyBind11
     kernel_func(
         pbr_mat.accounted_blocks(),
         features,
@@ -91,6 +93,10 @@ def pbr_batched_matmul_cuda(pbr_mat, x: torch.Tensor, y: torch.Tensor, batch_siz
         meta['coords'],
         meta['offsets'],
         meta['data'],
+        pbr_mat.remainder_nnz(),
+        meta['rem_rows'],
+        meta['rem_cols'],
+        meta['rem_vals'],
         x,
         y
     )

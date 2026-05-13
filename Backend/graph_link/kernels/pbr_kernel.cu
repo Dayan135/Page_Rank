@@ -105,38 +105,90 @@ void launch_pbr_spmm(
     const int cols,
     const int rows,
     const int runtime_block_rows,
-    const int runtime_block_cols, 
+    const int runtime_block_cols,
     const uint64_t* block_codes,
     const index_t* block_coords,
     const index_t* block_offsets,
     const scalar_t* block_data,
     const scalar_t* X,
-    scalar_t* Y
+    scalar_t* Y,
+    cudaStream_t stream
 ) {
-    int threads_per_block = THREADS_PER_BLOCK_VER3; 
-    
-    // We now use your macro directly instead of calculating it based on the features variable
+    int threads_per_block = THREADS_PER_BLOCK_VER3;
     dim3 grid(num_pbr_blocks, batch_size, (features + threads_per_block - 1) / threads_per_block);
     dim3 block(threads_per_block);
 
     if (runtime_block_rows == 2 && runtime_block_cols == 2) {
-        pbr_spmm_shared_reg_kernel<index_t, scalar_t, 2, 2><<<grid, block>>>(
-            num_pbr_blocks, features, batch_size, cols, rows, 
+        pbr_spmm_shared_reg_kernel<index_t, scalar_t, 2, 2><<<grid, block, 0, stream>>>(
+            num_pbr_blocks, features, batch_size, cols, rows,
             block_codes, block_coords, block_offsets, block_data, X, Y
         );
     } else if (runtime_block_rows == 4 && runtime_block_cols == 4) {
-        pbr_spmm_shared_reg_kernel<index_t, scalar_t, 4, 4><<<grid, block>>>(
-            num_pbr_blocks, features, batch_size, cols, rows, 
+        pbr_spmm_shared_reg_kernel<index_t, scalar_t, 4, 4><<<grid, block, 0, stream>>>(
+            num_pbr_blocks, features, batch_size, cols, rows,
             block_codes, block_coords, block_offsets, block_data, X, Y
         );
     } else if (runtime_block_rows == 8 && runtime_block_cols == 8) {
-        pbr_spmm_shared_reg_kernel<index_t, scalar_t, 8, 8><<<grid, block>>>(
-            num_pbr_blocks, features, batch_size, cols, rows, 
+        pbr_spmm_shared_reg_kernel<index_t, scalar_t, 8, 8><<<grid, block, 0, stream>>>(
+            num_pbr_blocks, features, batch_size, cols, rows,
             block_codes, block_coords, block_offsets, block_data, X, Y
         );
     } else {
         throw std::invalid_argument("Unsupported block size.");
     }
+}
+
+// COO remainder kernel — one (nz_idx, batch, feat_tile) thread-block per nonzero
+template <typename scalar_t>
+__global__ void coo_spmm_kernel(
+    const int nnz,
+    const int features,
+    const int batch_size,
+    const int cols,
+    const int rows,
+    const int32_t* __restrict__ coo_rows,
+    const int32_t* __restrict__ coo_cols,
+    const scalar_t* __restrict__ coo_vals,
+    const scalar_t* __restrict__ X,
+    scalar_t*       __restrict__ Y
+) {
+    const int nz_idx   = blockIdx.x;
+    const int batch_idx = blockIdx.y;
+    if (nz_idx >= nnz || batch_idx >= batch_size) return;
+
+    const int32_t row = coo_rows[nz_idx];
+    const int32_t col = coo_cols[nz_idx];
+    const scalar_t val = coo_vals[nz_idx];
+
+    const int stride = gridDim.z * blockDim.x;
+    for (int feat = blockIdx.z * blockDim.x + threadIdx.x; feat < features; feat += stride) {
+        atomicAdd(
+            &Y[batch_idx * rows * features + row * features + feat],
+            val * X[batch_idx * cols * features + col * features + feat]
+        );
+    }
+}
+
+template <typename scalar_t>
+void launch_coo_spmm(
+    int nnz,
+    int features,
+    int batch_size,
+    int cols,
+    int rows,
+    const int32_t* coo_rows,
+    const int32_t* coo_cols,
+    const scalar_t* coo_vals,
+    const scalar_t* X,
+    scalar_t* Y,
+    cudaStream_t stream
+) {
+    if (nnz == 0) return;
+    const int threads = THREADS_PER_BLOCK_VER3;
+    dim3 grid(nnz, batch_size, (features + threads - 1) / threads);
+    coo_spmm_kernel<scalar_t><<<grid, threads, 0, stream>>>(
+        nnz, features, batch_size, cols, rows, coo_rows, coo_cols, coo_vals, X, Y
+    );
 }
 
 
@@ -300,10 +352,13 @@ template void launch_missing_mass<double>(const double*, double*, int, int);
 
 
 // Explicit instantiations
-template void launch_pbr_spmm<int32_t, float>(const int, const int, const int, const int, const int, const int, const int, const uint64_t*, const int32_t*, const int32_t*, const float*, const float*, float*);
-template void launch_pbr_spmm<int64_t, float>(const int, const int, const int, const int, const int, const int, const int, const uint64_t*, const int64_t*, const int64_t*, const float*, const float*, float*);
-template void launch_pbr_spmm<int32_t, double>(const int, const int, const int, const int, const int, const int, const int, const uint64_t*, const int32_t*, const int32_t*, const double*, const double*, double*);
-template void launch_pbr_spmm<int64_t, double>(const int, const int, const int, const int, const int, const int, const int, const uint64_t*, const int64_t*, const int64_t*, const double*, const double*, double*);
+template void launch_pbr_spmm<int32_t, float>(const int, const int, const int, const int, const int, const int, const int, const uint64_t*, const int32_t*, const int32_t*, const float*,  const float*,  float*,  cudaStream_t);
+template void launch_pbr_spmm<int64_t, float>(const int, const int, const int, const int, const int, const int, const int, const uint64_t*, const int64_t*, const int64_t*, const float*,  const float*,  float*,  cudaStream_t);
+template void launch_pbr_spmm<int32_t, double>(const int, const int, const int, const int, const int, const int, const int, const uint64_t*, const int32_t*, const int32_t*, const double*, const double*, double*, cudaStream_t);
+template void launch_pbr_spmm<int64_t, double>(const int, const int, const int, const int, const int, const int, const int, const uint64_t*, const int64_t*, const int64_t*, const double*, const double*, double*, cudaStream_t);
+
+template void launch_coo_spmm<float> (int, int, int, int, int, const int32_t*, const int32_t*, const float*,  const float*,  float*,  cudaStream_t);
+template void launch_coo_spmm<double>(int, int, int, int, int, const int32_t*, const int32_t*, const double*, const double*, double*, cudaStream_t);
 
 // Missing Mass Kernel
 template __global__ void batched_missing_mass_kernel<float>(const float*, float*, int, int);

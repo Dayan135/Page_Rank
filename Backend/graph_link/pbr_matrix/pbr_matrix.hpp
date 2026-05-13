@@ -178,6 +178,19 @@ struct pbr_matrix_t {
         d["block_coords"] = py::array_t<index_t>(block_coords.size() * 2, (index_t*)block_coords.data());
         d["block_offsets"] = py::array_t<index_t>(block_offsets.size(), block_offsets.data());
         d["block_data"] = py::array_t<scalar_t>(block_data.size(), block_data.data());
+
+        // Remainder COO — exported as three flat arrays for GPU transfer
+        const size_t rem_nnz = remainder_coo.size();
+        std::vector<index_t>  r_rows(rem_nnz), r_cols(rem_nnz);
+        std::vector<scalar_t> r_vals(rem_nnz);
+        for (size_t i = 0; i < rem_nnz; ++i) {
+            r_rows[i] = remainder_coo[i].row;
+            r_cols[i] = remainder_coo[i].col;
+            r_vals[i] = remainder_coo[i].val;
+        }
+        d["rem_rows"] = py::array_t<index_t> (rem_nnz, r_rows.data());
+        d["rem_cols"] = py::array_t<index_t> (rem_nnz, r_cols.data());
+        d["rem_vals"] = py::array_t<scalar_t>(rem_nnz, r_vals.data());
         return d;
     }
 };

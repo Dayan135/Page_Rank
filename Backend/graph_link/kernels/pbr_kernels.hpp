@@ -16,7 +16,23 @@ void launch_pbr_spmm(
     const index_t* block_offsets,
     const scalar_t* block_data,
     const scalar_t* X,
-    scalar_t* Y
+    scalar_t* Y,
+    cudaStream_t stream = 0
+);
+
+template <typename scalar_t>
+void launch_coo_spmm(
+    int nnz,
+    int features,
+    int batch_size,
+    int cols,
+    int rows,
+    const int32_t* coo_rows,
+    const int32_t* coo_cols,
+    const scalar_t* coo_vals,
+    const scalar_t* X,
+    scalar_t* Y,
+    cudaStream_t stream
 );
 
 template <typename scalar_t>
