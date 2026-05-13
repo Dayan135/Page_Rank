@@ -217,7 +217,7 @@ void launch_coo_spmm(
     cudaStream_t stream
 ) {
     if (nnz == 0) return;
-    const int threads = THREADS_PER_BLOCK_VER3;
+    const int threads = THREADS_PER_BLOCK;
     dim3 grid(nnz, batch_size, (features + threads - 1) / threads);
     coo_spmm_kernel<scalar_t><<<grid, threads, 0, stream>>>(
         nnz, features, batch_size, cols, rows, coo_rows, coo_cols, coo_vals, X, Y
