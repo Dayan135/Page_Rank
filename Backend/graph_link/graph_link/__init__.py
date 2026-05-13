@@ -64,9 +64,8 @@ for cls_name in ["PBRMatrixInt64Float", "PBRMatrixInt32Float",
     
 def pbr_batched_matmul_cuda(pbr_mat, x: torch.Tensor, y: torch.Tensor, batch_size: int, features: int):
     """
-    Launches block SpMM and COO remainder SpMM.
-    Y is zeroed asynchronously inside the C++ wrapper before the kernels run —
-    callers do NOT need to zero y before calling this function.
+    Launches block SpMM and COO remainder SpMM on two CUDA streams in parallel,
+    then synchronizes via the combined C++ wrapper.
     """
     meta = get_pbr_gpu_meta(pbr_mat)
     if meta is None:
@@ -125,11 +124,11 @@ def pbr_matmul(pbr_mat, x: torch.Tensor):
             # First-time use: trigger the injected .to() method
             pbr_mat = pbr_mat.to(x.device)
         
-        # C++ wrapper zeros Y asynchronously before launching kernels.
+        # Allocate Y with the exact same dimensionality as X
         if x.dim() == 2:
-            y = torch.empty((pbr_mat.rows, width), dtype=x.dtype, device=x.device)
+            y = torch.zeros((pbr_mat.rows, width), dtype=x.dtype, device=x.device)
         else:
-            y = torch.empty((batch, pbr_mat.rows, width), dtype=x.dtype, device=x.device)
+            y = torch.zeros((batch, pbr_mat.rows, width), dtype=x.dtype, device=x.device)
         
         # Invoke Native CUDA C++ Kernel
         pbr_batched_matmul_cuda(pbr_mat, x, y, batch, width)
@@ -230,7 +229,6 @@ def run_personalized_pagerank(
     alpha: float = 0.85,
     max_iterations: int = 100,
     tolerance: float = 1e-6,
-    check_interval: int = 5,
 ):
     """
     Batched Personalized PageRank via power iteration:
@@ -239,12 +237,6 @@ def run_personalized_pagerank(
 
     pbr_mat must be on GPU and built from a column-stochastic matrix
     (use normalize_transition_matrix() to prepare the adjacency matrix).
-
-    The entire iteration loop runs in C++ with no Python interaction between
-    iterations, eliminating per-iteration CPU-GPU synchronisation overhead.
-
-    check_interval: check convergence every N iterations (0 = fixed iterations,
-                    no early exit — useful for benchmarking).
 
     Returns (X, iterations_run, converged).
     """
@@ -260,32 +252,29 @@ def run_personalized_pagerank(
     K      = source_nodes.shape[0]
     dtype  = meta['data'].dtype
 
+    # Single X buffer (updated in-place), one Y buffer for SpMM output.
     X      = torch.zeros((N, K), dtype=dtype, device=device)
-    Y      = torch.empty((N, K), dtype=dtype, device=device)   # zeroed in C++ each iter
+    Y      = torch.zeros((N, K), dtype=dtype, device=device)
     errors = torch.zeros(K,      dtype=dtype, device=device)
 
     if dtype == torch.float32:
-        init_fn = core.init_ppr_cuda_float
-        loop_fn = core.run_ppr_cuda_loop_int32_float
+        init_fn   = core.init_ppr_cuda_float
+        update_fn = core.ppr_update_normalized_cuda_float
     else:
-        init_fn = core.init_ppr_cuda_double
-        loop_fn = core.run_ppr_cuda_loop_int32_double
+        init_fn   = core.init_ppr_cuda_double
+        update_fn = core.ppr_update_normalized_cuda_double
 
     init_fn(X, source_nodes, N, K)
 
-    iters_run, converged = loop_fn(
-        pbr_mat.accounted_blocks(), K, pbr_mat.cols, pbr_mat.rows,
-        pbr_mat.block_rows, pbr_mat.block_cols,
-        meta['codes'], meta['coords'], meta['offsets'], meta['data'],
-        pbr_mat.remainder_nnz(),
-        meta['rem_rows'], meta['rem_cols'], meta['rem_vals'],
-        source_nodes,
-        X, Y, errors,
-        alpha, max_iterations, tolerance,
-        check_interval,
-    )
+    for t in range(max_iterations):
+        Y.zero_()                                          # clear for atomicAdd
+        pbr_batched_matmul_cuda(pbr_mat, X, Y, 1, K)      # Y = A @ X
+        update_fn(Y, X, source_nodes, alpha, N, K, errors) # X = alpha*Y + (1-alpha)*e_s
 
-    return X, iters_run, converged
+        if errors.max().item() < tolerance:
+            return X, t + 1, True
+
+    return X, max_iterations, False
 
 
 __all__ = [
