@@ -7,7 +7,12 @@ A GPU-accelerated **Personalized PageRank (PPR)** engine built around a custom s
 The project has three layers:
 1. **`Backend/graph_link/`** — a pip-installable Python package containing custom CUDA kernels (C++/CUDA), pybind11 bindings, and a high-level Python API.
 2. **`Tests/`** — correctness tests (`test_spmm.py`, `test_ppr_accuracy.py`) and performance benchmarks (`test_benchmark.py`, `benchmark_spdmm.py`).
-3. **`Frontend/`** — a pipeline test harness.
+3. **`Frontend/`** — a React SPA for uploading graphs, running PPR, and exploring results visually.
+
+## Remote machine requirement
+
+**All compilation and testing must run on the remote GPU machine via SSH.**  
+Do not attempt to build CUDA extensions or run tests locally — they will fail without a GPU.
 
 ## Build
 
@@ -59,7 +64,51 @@ All tests require a CUDA-capable GPU.
 | `Tests/matrices.py` | Synthetic matrix generators for benchmarking |
 
 For deeper detail on `graph_link` internals see `Backend/graph_link/CLAUDE.md`.  
-For test suite details see `Tests/CLAUDE.md`.
+For test suite details see `Tests/CLAUDE.md`.  
+For the React frontend see `Frontend/CLAUDE.md`.
+
+---
+
+## Frontend (React SPA)
+
+A client-side PPR analysis tool — **no GPU required to run it**. The mock algorithm runs in the browser; the adapter pattern in `Frontend/src/lib/ppr/adapter.ts` is the single swap-point to connect it to the real CUDA backend later.
+
+### Running locally
+
+```bash
+cd Frontend
+npm install
+npm run dev        # http://localhost:5173
+```
+
+### Other scripts
+
+```bash
+npm run build      # production bundle → dist/
+npm run test       # Vitest, all suites (~40 tests)
+npm run lint       # ESLint, 0 warnings allowed
+npm run typecheck  # tsc --noEmit
+```
+
+### What it does
+
+Three-step wizard: **Upload → Configure → Results**.
+
+1. **Upload** — pick CSV format (edge list / COO triplets / adjacency matrix) then drop a file. Sample graphs in `Frontend/public/samples/` let you try it without a real file.
+2. **Configure** — tune α (damping), max iterations, tolerance, top-X, seed nodes.
+3. **Results** — four tabs: top-ranked node cards, full sortable table, charts (rank distribution, convergence, degree histogram), interactive network graph (React Flow).
+
+### CSV formats accepted
+
+| Format | Required columns | Node IDs |
+|---|---|---|
+| Edge list | `source`, `target` (+ optional `weight`) | as-is from CSV |
+| COO triplets | `row_idx`, `col_idx`, `value` | auto-named `n0`, `n1`, … |
+| Adjacency matrix | header row + row labels | as-is from CSV |
+
+### Wiring the real backend
+
+See `Frontend/CLAUDE.md` → "Adapter swap-point" for step-by-step instructions. In short: add a FastAPI endpoint wrapping `graph_link.run_personalized_pagerank`, then change one line in `Frontend/src/lib/ppr/adapter.ts`.
 
 ---
 
