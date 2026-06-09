@@ -1,5 +1,5 @@
 import { NavLink } from "react-router-dom";
-import { Network, Settings2, BarChart3 } from "lucide-react";
+import { Network, Settings2, BarChart3, BookOpen } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ThemeToggle } from "./ThemeToggle";
 import { useAppStore } from "@/store/useAppStore";
@@ -8,6 +8,7 @@ const NAV_ITEMS = [
   { to: "/upload", label: "Upload", icon: Network },
   { to: "/configure", label: "Configure", icon: Settings2 },
   { to: "/results", label: "Results", icon: BarChart3 },
+  { to: "/learn", label: "Learn", icon: BookOpen },
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -60,8 +61,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       </main>
       <footer className="border-t">
         <div className="container py-4 text-xs text-muted-foreground font-mono">
-          PPR Analyzer · client-side mock · swap-in real CUDA backend via{" "}
-          <span className="text-foreground">src/lib/ppr/adapter.ts</span>
+          PPR Analyzer · GPU-backed Personalized PageRank via{" "}
+          <span className="text-foreground">graph_link</span> (CUDA)
         </div>
       </footer>
     </div>

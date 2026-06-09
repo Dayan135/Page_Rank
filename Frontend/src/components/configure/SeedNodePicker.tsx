@@ -1,9 +1,10 @@
 import { useMemo, useState } from "react";
-import { Check, ChevronsUpDown, X } from "lucide-react";
+import { Check, ChevronsUpDown, Info, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { Label } from "@/components/ui/label";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { NodeId } from "@/lib/ppr/types";
 
@@ -28,7 +29,25 @@ export function SeedNodePicker({ nodes, seeds, onChange }: SeedNodePickerProps) 
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
-        <Label className="text-sm">Personalization seeds</Label>
+        <div className="flex items-center gap-1.5">
+          <Label className="text-sm">Personalization seeds</Label>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                aria-label="What is a seed node?"
+                className="text-muted-foreground transition-colors hover:text-foreground"
+              >
+                <Info className="h-3.5 w-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs text-xs leading-relaxed">
+              Seeds are the nodes the random surfer restarts from. Personalized PageRank
+              measures importance <em>relative to these seeds</em> — nodes closer to them
+              score higher. Pick at least one (e.g. a user, topic, or page of interest).
+            </TooltipContent>
+          </Tooltip>
+        </div>
         {seeds.length > 0 && (
           <Button
             variant="ghost"
@@ -50,7 +69,7 @@ export function SeedNodePicker({ nodes, seeds, onChange }: SeedNodePickerProps) 
           >
             <span className="truncate">
               {seeds.length === 0
-                ? "Uniform (no seeds)"
+                ? "Select at least one seed node"
                 : `${seeds.length} seed${seeds.length === 1 ? "" : "s"} selected`}
             </span>
             <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
@@ -100,7 +119,7 @@ export function SeedNodePicker({ nodes, seeds, onChange }: SeedNodePickerProps) 
         </div>
       )}
       <p className="text-xs text-muted-foreground">
-        Empty = uniform restart over all nodes (standard PageRank).
+        At least one seed is required — ranks are personalized toward the selected node(s).
       </p>
     </div>
   );

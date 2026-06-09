@@ -1,0 +1,4 @@
+# Backend HTTP service deps. torch / scipy / numpy / graph_link come from the
+# project's conda env (see Backend/graph_link/CLAUDE.md); only these are extra.
+fastapi>=0.110
+uvicorn[standard]>=0.29

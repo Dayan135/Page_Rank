@@ -39,6 +39,7 @@ export function ConfigPanel() {
   };
 
   const isRunning = runStatus === "computing";
+  const noSeeds = params.seeds.length === 0;
 
   return (
     <Card>
@@ -63,7 +64,7 @@ export function ConfigPanel() {
           variant="accent"
           size="lg"
           onClick={compute}
-          disabled={isRunning}
+          disabled={isRunning || noSeeds}
           className="w-full"
         >
           {isRunning ? (
@@ -76,6 +77,11 @@ export function ConfigPanel() {
             </>
           )}
         </Button>
+        {noSeeds && (
+          <p className="text-center text-xs text-muted-foreground">
+            Select at least one seed node to compute.
+          </p>
+        )}
       </CardContent>
     </Card>
   );

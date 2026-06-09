@@ -25,6 +25,23 @@ vi.mock("file-saver", () => ({
   saveAs: (...args: unknown[]) => saveAsSpy(...args),
 }));
 
+// The app's adapter now POSTs to the CUDA backend over HTTP. For this UI
+// data-flow test (no server in happy-dom), route algorithm.run through the
+// in-browser reference implementation instead.
+vi.mock("@/lib/ppr/adapter", async () => {
+  const { computeMockPersonalizedPageRank } = await import(
+    "@/lib/ppr/computeMockPersonalizedPageRank"
+  );
+  return {
+    algorithm: {
+      run: async (
+        graph: import("@/lib/ppr/types").Graph,
+        params: import("@/lib/ppr/types").PPRParams,
+      ) => computeMockPersonalizedPageRank(graph, params),
+    },
+  };
+});
+
 function renderApp() {
   return render(
     <ThemeProvider attribute="class" defaultTheme="light">
@@ -65,8 +82,11 @@ describe("upload → compute → export integration", () => {
     await waitFor(() => expect(useAppStore.getState().graph).not.toBeNull());
     expect(useAppStore.getState().graph?.nodes).toHaveLength(3);
 
-    // 4. Click Compute PPR.
+    // 4. PPR requires ≥1 seed. Select one via the store (the seed-picker popover
+    //    is Radix/cmdk and not what this data-flow test exercises), then Compute.
+    useAppStore.getState().setSeeds(["A"]);
     const computeBtn = await screen.findByRole("button", { name: /compute ppr/i });
+    await waitFor(() => expect(computeBtn).toBeEnabled());
     await userEvent.click(computeBtn);
 
     // 5. Results land in the store and a top node appears.

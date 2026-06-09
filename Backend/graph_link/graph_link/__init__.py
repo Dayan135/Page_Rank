@@ -213,6 +213,7 @@ def run_personalized_pagerank(
     alpha: float = 0.85,
     max_iterations: int = 100,
     tolerance: float = 1e-6,
+    return_history: bool = False,
 ):
     """
     Batched Personalized PageRank via power iteration:
@@ -222,7 +223,9 @@ def run_personalized_pagerank(
     pbr_mat must be on GPU and built from a column-stochastic matrix
     (use normalize_transition_matrix() to prepare the adjacency matrix).
 
-    Returns (X, iterations_run, converged).
+    Returns (X, iterations_run, converged); when return_history=True returns
+    (X, iterations_run, converged, history) where history[t] is the per-iteration
+    max (over the K source columns) L1 update error used for the convergence check.
     """
     meta = get_pbr_gpu_meta(pbr_mat)
     if meta is None:
@@ -249,14 +252,23 @@ def run_personalized_pagerank(
 
     init_fn(X, source_nodes, N, K)
 
+    history: list[float] = []
+    converged = False
+    iterations = max_iterations
     for t in range(max_iterations):
         Y = pbr_batched_matmul_cuda(pbr_mat, X).squeeze(0)  # Y = A @ X, shape [N, K]
         update_fn(Y, X, source_nodes, alpha, N, K, errors)  # X = alpha*Y + (1-alpha)*e_s
 
-        if errors.max().item() < tolerance:
-            return X, t + 1, True
+        err = errors.max().item()  # already synced for the convergence check; reuse it
+        history.append(err)
+        if err < tolerance:
+            iterations = t + 1
+            converged = True
+            break
 
-    return X, max_iterations, False
+    if return_history:
+        return X, iterations, converged, history
+    return X, iterations, converged
 
 
 __all__ = [
