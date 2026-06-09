@@ -1,10 +1,21 @@
 # PPR Analyzer — agent guide
 
-Self-contained React SPA for Personalized PageRank analysis. Client-side **mock** computation today; a single-file swap connects it to the GPU backend in [`../Backend/graph_link/`](../Backend/graph_link/).
+React SPA for Personalized PageRank analysis. **Wired to the GPU backend**: the
+adapter POSTs to a FastAPI service ([`../Backend/server/`](../Backend/server/))
+that wraps `graph_link.run_personalized_pagerank`. The in-browser mock is kept
+behind the adapter for tests/offline use.
 
 ## What this app does
 
-User flow: `Upload` → `Configure` → `Results`. The user picks a CSV format (edge list / COO / adjacency), drops a file, tunes params (α, maxIter, tolerance, topX, seed nodes), and explores PPR results as cards, a table, charts, and a node-link graph.
+User flow: `Upload` → `Configure` → `Results` (plus a `Learn` page explaining
+the PageRank / PPR math). The user picks a CSV format (edge list / COO /
+adjacency), drops a file, tunes params (α, maxIter, tolerance, topX, seed
+nodes), and explores PPR results as cards, a table, charts, and a node-link
+graph.
+
+**Personalized PageRank requires ≥1 seed.** The seed picker carries an "i"
+info-tooltip explaining what a seed is, and the *Compute PPR* button is disabled
+until at least one seed is selected (the backend also returns `422` if none).
 
 State management is **Zustand**, kept in a single store at [`src/store/useAppStore.ts`](src/store/useAppStore.ts):
 
@@ -12,19 +23,28 @@ State management is **Zustand**, kept in a single store at [`src/store/useAppSto
 { format, graph, params, result, runStatus, error }
 ```
 
-## Adapter swap-point — wiring the real CUDA backend
+## Adapter swap-point — the GPU backend (wired)
 
-The whole point of the abstraction. The UI calls `algorithm.run(graph, params)` and does not care whether the result comes from JS or a remote GPU.
+The whole point of the abstraction. The UI calls `algorithm.run(graph, params)`
+and does not care whether the result comes from JS or a remote GPU.
 
 **File:** [`src/lib/ppr/adapter.ts`](src/lib/ppr/adapter.ts)
 
-To plug in the real backend later:
+- `algorithm` = `httpAdapter`: POSTs `{ graph, params }` to `${VITE_PPR_API}/ppr`
+  (default base `/api`) and rebuilds the `Map` fields (`ranks`, `degrees.in/out`)
+  from the plain JSON objects the server returns.
+- `mockAdapter` (the in-browser power iteration) is still exported for tests and
+  offline use.
 
-1. Add a FastAPI endpoint in `../Backend/` that wraps `graph_link.run_personalized_pagerank` and returns the same JSON shape as `PPRResult` ([`src/lib/ppr/types.ts`](src/lib/ppr/types.ts)).
-2. In `adapter.ts`, uncomment the `httpAdapter` block and switch the exported `algorithm` to point at it.
-3. Make sure the FastAPI response converts `Map<NodeId, number>` to plain objects (and the client back into Maps — adjust the JSON parsing accordingly).
+**Dev networking:** Vite proxies `/api` → `VITE_PPR_TARGET` (default
+`http://localhost:8000`) — see [`vite.config.ts`](vite.config.ts). If the backend
+runs on a remote GPU box, SSH-tunnel its port. For a static build, set
+`VITE_PPR_API` to the backend's absolute URL. See
+[`../Backend/server/README.md`](../Backend/server/README.md).
 
-The component layer never sees this change. Tests for the mock continue to live under `src/test/ppr/`; add separate integration tests against a real backend if needed.
+The component layer never sees the transport. The integration test
+(`src/test/integration/`) `vi.mock`s the adapter to the in-browser implementation
+so it runs without a server.
 
 ## File map (where to look for what)
 
@@ -35,6 +55,9 @@ The component layer never sees this change. Tests for the mock continue to live 
 | PPR algorithm (mock)             | [`src/lib/ppr/computeMockPersonalizedPageRank.ts`](src/lib/ppr/computeMockPersonalizedPageRank.ts) |
 | Algorithm interface + defaults   | [`src/lib/ppr/types.ts`](src/lib/ppr/types.ts) |
 | Adapter (swap-point)             | [`src/lib/ppr/adapter.ts`](src/lib/ppr/adapter.ts) |
+| Backend service (FastAPI)        | [`../Backend/server/app.py`](../Backend/server/app.py) |
+| Explanation page (PageRank math) | [`src/pages/LearnPage.tsx`](src/pages/LearnPage.tsx) |
+| Seed picker (info tooltip)       | [`src/components/configure/SeedNodePicker.tsx`](src/components/configure/SeedNodePicker.tsx) |
 | Export (CSV / JSON)              | [`src/lib/export/toCSV.ts`](src/lib/export/toCSV.ts), [`toJSON.ts`](src/lib/export/toJSON.ts) |
 | Global store                     | [`src/store/useAppStore.ts`](src/store/useAppStore.ts) |
 | Routing + providers              | [`src/App.tsx`](src/App.tsx) |

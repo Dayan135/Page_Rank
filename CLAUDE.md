@@ -4,10 +4,11 @@
 
 A GPU-accelerated **Personalized PageRank (PPR)** engine built around a custom sparse matrix format called **Packed Block Representation (PBR)**. The core insight is that many real-world graphs (social networks, web graphs) have block-sparse adjacency matrices — PBR exploits this structure to outperform the generic cuSPARSE SpMM primitive for block-structured matrices.
 
-The project has three layers:
-1. **`Backend/graph_link/`** — a pip-installable Python package containing custom CUDA kernels (C++/CUDA), pybind11 bindings, and a high-level Python API.
-2. **`Tests/`** — correctness tests (`test_spmm.py`, `test_ppr_accuracy.py`) and performance benchmarks (`test_benchmark.py`, `benchmark_spdmm.py`).
-3. **`Frontend/`** — a React SPA for uploading graphs, running PPR, and exploring results visually.
+The project has four layers:
+1. **`Backend/graph_link/`** — a pip-installable Python package containing custom CUDA kernels (C++/CUDA), pybind11 bindings, and a high-level Python API. The PBR SpMM path is manually synced from `research_spdmm/fem` (branch `feat/pbr-csr-remainder`): vectorized block kernel + a **CSR remainder** kernel.
+2. **`Backend/server/`** — a FastAPI service wrapping `graph_link.run_personalized_pagerank`, consumed by the frontend (`POST /api/ppr`).
+3. **`Tests/`** — correctness tests (`test_spmm.py`, `test_ppr_accuracy.py`) and performance benchmarks (`test_benchmark.py`, `benchmark_spdmm.py`).
+4. **`Frontend/`** — a React SPA for uploading graphs, running PPR, and exploring results visually; wired to the backend via `src/lib/ppr/adapter.ts`.
 
 ## Remote machine requirement
 
@@ -24,15 +25,24 @@ pip install -e Backend/graph_link/ --no-build-isolation
 
 After any change to `.cu` or `.cpp` files under `Backend/graph_link/`, rebuild before running tests.
 
-## Environment (Linux GPU machine)
+## Environment (BGU GPU cluster)
+
+There is **no `/usr/local/cuda`** on the cluster — load the toolkit from the
+module system (`cuda/12.5` matches torch's cu121; the node default nvcc is 13.x,
+too new) and derive `CUDA_HOME` from it. Conda env: `pageRank_312`.
 
 ```bash
+module load cuda/12.5
 export CC=$(which x86_64-conda-linux-gnu-cc)
 export CXX=$(which x86_64-conda-linux-gnu-c++)
 export CUDAHOSTCXX=$CXX
-export CUDA_HOME=/usr/local/cuda-12.5
+export CUDA_HOME="$(dirname "$(dirname "$(which nvcc)")")"
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$CUDA_HOME/lib64:$LD_LIBRARY_PATH  # .so needs CXXABI_1.3.15 from conda libstdc++
 export PYTHONPATH=$PYTHONPATH:/home/dayanb/SoftwareProjectPageRank/Backend/graph_link
 ```
+
+Build + test on the cluster pin an RTX 3090 (`--gres=gpu:rtx_3090:1`, the
+extension is sm_86-only). See the memory note `page-rank-cluster-run-setup`.
 
 ## Running tests
 
@@ -54,11 +64,13 @@ All tests require a CUDA-capable GPU.
 
 | Path | Purpose |
 |---|---|
-| `Backend/graph_link/kernels/pbr_kernel.cu` | All CUDA kernels: SpMM, PPR init, PPR update, full PPR loop |
-| `Backend/graph_link/kernels/pbr_kernels.hpp` | Launcher declarations |
-| `Backend/graph_link/bindings/bindings_kernels.cu` | pybind11 wrappers; `run_ppr_cuda_loop` orchestration |
+| `Backend/graph_link/kernels/pbr_kernel.cu` | PBR block SpMM (scalar + vectorized) and the CSR remainder kernel + launchers |
+| `Backend/graph_link/kernels/ppr_kernel.cu` | PPR kernels (init, missing-mass, update) |
+| `Backend/graph_link/kernels/pbr_kernels.hpp` | Launcher declarations (`launch_pbr_spmm`, `launch_csr_spmm`) |
+| `Backend/graph_link/bindings/bindings_kernels.cu` | ATen wrappers: `pbr_spmm_cuda_dispatch` (allocates+returns Y, two streams) + PPR wrappers |
 | `Backend/graph_link/graph_link/__init__.py` | High-level Python API (`csr_to_pbr`, `pbr_matmul`, `run_personalized_pagerank`) |
 | `Backend/graph_link/graph_link/pbr_registry.py` | GPU metadata cache keyed by `id(pbr_mat)` |
+| `Backend/server/app.py` | FastAPI service (`POST /api/ppr`) wrapping `run_personalized_pagerank` |
 | `Tests/test_benchmark.py` | PPR performance benchmarks (pytest-benchmark) |
 | `Tests/benchmark_spdmm.py` | Standalone SpMM sweep (CUDA events, optional W&B) |
 | `Tests/matrices.py` | Synthetic matrix generators for benchmarking |
@@ -71,7 +83,7 @@ For the React frontend see `Frontend/CLAUDE.md`.
 
 ## Frontend (React SPA)
 
-A client-side PPR analysis tool — **no GPU required to run it**. The mock algorithm runs in the browser; the adapter pattern in `Frontend/src/lib/ppr/adapter.ts` is the single swap-point to connect it to the real CUDA backend later.
+A PPR analysis tool **wired to the GPU backend** through `Frontend/src/lib/ppr/adapter.ts`: the default `httpAdapter` POSTs to the FastAPI service in `Backend/server/`. The in-browser mock is kept behind the same adapter for tests/offline use, so `npm run dev` needs the backend reachable (or `VITE_PPR_API` set).
 
 ### Running locally
 
@@ -92,10 +104,11 @@ npm run typecheck  # tsc --noEmit
 
 ### What it does
 
-Three-step wizard: **Upload → Configure → Results**.
+Three-step wizard: **Upload → Configure → Results**, plus a **Learn** page
+explaining the PageRank / PPR math.
 
 1. **Upload** — pick CSV format (edge list / COO triplets / adjacency matrix) then drop a file. Sample graphs in `Frontend/public/samples/` let you try it without a real file.
-2. **Configure** — tune α (damping), max iterations, tolerance, top-X, seed nodes.
+2. **Configure** — tune α (damping), max iterations, tolerance, top-X, and seed nodes. **At least one seed is required** (an "i" tooltip explains seeds; Compute is disabled until one is chosen).
 3. **Results** — four tabs: top-ranked node cards, full sortable table, charts (rank distribution, convergence, degree histogram), interactive network graph (React Flow).
 
 ### CSV formats accepted
@@ -106,9 +119,13 @@ Three-step wizard: **Upload → Configure → Results**.
 | COO triplets | `row_idx`, `col_idx`, `value` | auto-named `n0`, `n1`, … |
 | Adjacency matrix | header row + row labels | as-is from CSV |
 
-### Wiring the real backend
+### Backend connection
 
-See `Frontend/CLAUDE.md` → "Adapter swap-point" for step-by-step instructions. In short: add a FastAPI endpoint wrapping `graph_link.run_personalized_pagerank`, then change one line in `Frontend/src/lib/ppr/adapter.ts`.
+Wired via `httpAdapter` in `Frontend/src/lib/ppr/adapter.ts`. In dev, Vite
+proxies `/api` → `VITE_PPR_TARGET` (default `http://localhost:8000`); for a
+remote GPU box, SSH-tunnel the port. Run the service with
+`uvicorn app:app` from `Backend/server/` (see its `README.md`). For a static
+build, set `VITE_PPR_API` to the backend's absolute URL.
 
 ---
 

@@ -2,199 +2,199 @@
 
 ## What this is
 
-`graph_link` is a Python library (pip-installable) that provides a **Packed Block Representation (PBR)** sparse matrix format and fast SpMM (sparse × dense matrix multiplication) via custom CUDA kernels. The primary use-case is GPU-accelerated Personalized PageRank.
+`graph_link` is a pip-installable Python library providing a **Packed Block
+Representation (PBR)** sparse matrix format and a fast SpMM (sparse × dense)
+via custom CUDA kernels. The primary use-case is GPU-accelerated Personalized
+PageRank. The PBR multiplication path is **manually synced** from the research
+repo (`research_spdmm/fem`, branch `feat/pbr-csr-remainder`) — when the kernel
+changes there, update it here by hand.
 
 ---
 
 ## How to build
 
 ```bash
-# From repo root (or from this directory with just '.')
 pip install -e Backend/graph_link/ --no-build-isolation
 ```
 
-`--no-build-isolation` is required so that the build uses the current conda/venv's PyTorch and CUDA rather than an isolated environment.
+`--no-build-isolation` is required so the build uses the active conda/venv's
+PyTorch + CUDA. Build system is **setuptools + `torch.utils.cpp_extension`**
+(`setup.py`); `CMakeLists.txt` is a standalone alternative not used by pip.
 
-The build system is **setuptools + `torch.utils.cpp_extension`** (setup.py). CMakeLists.txt exists but is not used by pip — it is a standalone CMake alternative.
+> **Cluster note:** there is no `/usr/local/cuda` on the BGU cluster — load the
+> toolkit from the module system (`module load cuda/12.5`, matching torch's
+> cu121) and derive `CUDA_HOME` from `which nvcc`. See the root `CLAUDE.md`.
 
-The compiled extension is `graph_link_core.cpython-312-x86_64-linux-gnu.so`, placed in the package root. After install the Python package `graph_link/` and the `.so` are both on sys.path via the editable link.
+The compiled extension is `graph_link_core.cpython-312-x86_64-linux-gnu.so`.
 
 ---
 
 ## Directory layout
 
 ```
-graph_link/                    ← pip install root
-├── setup.py                   ← build config (the one that matters for pip)
-├── pyproject.toml             ← build-system declaration (setuptools)
-├── CMakeLists.txt             ← standalone CMake (not used by pip)
-│
+graph_link/
+├── setup.py                   ← build config (the one pip uses)
 ├── pbr_matrix/
-│   ├── pbr_matrix.hpp         ← core data structures + CPU functions declared
-│   └── pbr_matrix.cpp         ← CPU implementations (csr_to_pbr, pbr_to_csr, pbr_batched_matmul_cpu)
-│
+│   ├── pbr_matrix.hpp         ← data structures + CPU function decls
+│   └── pbr_matrix.cpp         ← csr_to_pbr, pbr_to_csr, pbr_batched_matmul_cpu (at::Tensor)
 ├── kernels/
-│   ├── pbr_kernels.hpp        ← CUDA launcher declarations
-│   ├── pbr_kernel.cu          ← ALL CUDA kernels + launchers
-│   └── kernels.hpp            ← CUDA error-check utilities
-│
+│   ├── pbr_kernels.hpp        ← launcher declarations (launch_pbr_spmm, launch_csr_spmm)
+│   ├── pbr_kernel.cu          ← PBR block kernels + CSR remainder kernel + launchers
+│   ├── ppr_kernels.hpp        ← PPR launcher declarations
+│   ├── ppr_kernel.cu          ← PPR kernels (init / missing-mass / update)
+│   └── kernels.hpp            ← CUDA error-check utility
 ├── bindings/
-│   ├── bindings.cpp           ← pybind11 module definition (PYBIND11_MODULE(graph_link_core, m))
-│   └── bindings_kernels.cu    ← ATen-tensor wrappers that call CUDA launchers; bind_cuda_functions()
-│
+│   ├── bindings.cpp           ← PYBIND11_MODULE(graph_link_core, m); class + property getters
+│   └── bindings_kernels.cu    ← ATen wrappers: pbr_spmm_cuda_dispatch + PPR wrappers
 └── graph_link/                ← importable Python package
     ├── __init__.py            ← high-level API (pbr_matmul, csr_to_pbr, run_personalized_pagerank, …)
-    ├── pbr_registry.py        ← GPU metadata cache: dict[id(pbr_mat)] → {codes, coords, offsets, data, rem_*}
-    ├── pbr_matrix_triton.py   ← Triton alternative kernel (experimental)
+    ├── pbr_registry.py        ← GPU metadata cache: dict[id(pbr_mat)] → tensors
+    ├── pbr_matrix_triton.py   ← Triton alternative kernel (experimental, block-only)
     └── cluster_permute_csr.py ← CSR reordering utility
 ```
 
+An HTTP service that exposes this library to the React frontend lives in the
+sibling [`../server/`](../server/) (FastAPI).
+
 ---
 
-## Data structures
+## Data structures — `pbr_matrix_t<index_t, scalar_t>` (`pbr_matrix.hpp`)
 
-### `pbr_matrix_t<index_t, scalar_t>` (`pbr_matrix.hpp`)
-
-The PBR format splits a sparse matrix into two parts:
+PBR splits a sparse matrix into compressed blocks plus a **CSR remainder**:
 
 | Field | Type | Description |
 |---|---|---|
 | `rows`, `cols` | `index_t` | Matrix dimensions |
-| `block_rows`, `block_cols` | `index_t` | Block tile size (always equal, supported: 2, 4, 8) |
-| `block_codes` | `vector<uint64_t>` | Bitmask per block — bit k set means the k-th element of that block tile is nonzero |
+| `block_rows`, `block_cols` | `index_t` | Block tile size (equal; supported 2, 4, 8) |
+| `block_codes` | `vector<std::bitset<64>>` | Bitmask per block — bit k set ⇒ k-th tile element is nonzero |
 | `block_coords` | `vector<coord_t>` | Top-left (row, col) of each compressed block |
-| `block_offsets` | `vector<index_t>` | Start index into `block_data` for each block |
-| `block_data` | `vector<scalar_t>` | Packed nonzero values for all compressed blocks |
-| `remainder_coo` | `vector<coo_elem_t>` | Elements from blocks that had fewer nnz than `min_nnz_per_block` — stored as plain COO (row, col, val) |
+| `block_offsets` | `vector<index_t>` | Start index into `block_data` per block |
+| `block_data` | `vector<scalar_t>` | Packed nonzeros for all compressed blocks |
+| `remainder_indptr` | `vector<index_t>` | CSR row pointers (size `rows+1`) for leftover nnz |
+| `remainder_col_ind` | `vector<index_t>` | CSR column indices of the remainder |
+| `remainder_vals` | `vector<scalar_t>` | CSR values of the remainder |
 
-**A block is compressed only if it has ≥ `min_nnz_per_block` nonzeros.** Everything else goes into `remainder_coo`. This means:
-- `min_nnz=1` → almost nothing in remainder → remainder is tiny
-- `min_nnz=4` → blocks with 1–3 nnz go to remainder → remainder can be large
+**A block is compressed only if it has ≥ `min_nnz_per_block` nonzeros**; the
+rest go to the CSR remainder. So `min_nnz=1` → tiny remainder; higher `min_nnz`
+→ more mass in the remainder. (`coo_elem_t` still exists in the header but is
+vestigial — the remainder is CSR, not COO.)
 
-### `coo_elem_t<index_t, scalar_t>` (`pbr_matrix.hpp`)
-Simple struct: `{ index_t row; index_t col; scalar_t val; }`.
+`csr_to_pbr` flushes the trailing partial stripe when `rows % block_rows != 0`
+(a fix this copy carries that upstream research lacks).
 
 ---
 
 ## CUDA kernels (`kernels/pbr_kernel.cu`)
 
-### `pbr_spmm_shared_reg_kernel<index_t, scalar_t, BLOCK_ROWS, BLOCK_COLS>`
-Processes compressed blocks. Grid = `(num_pbr_blocks, batch_size, ceil(features/128))`.
-- Loads a tile of X into shared memory (coalesced).
-- Iterates over the bitmask to find nonzeros (uses `__ffsll`).
-- Accumulates into registers, then `atomicAdd` to Y.
-- Template-instantiated for block sizes 2×2, 4×4, 8×8.
+- **`pbr_spmm_zero_idle_kernel<index_t, scalar_t, BR, BC, TOTAL_SHARED, THREADS, FEAT_BLOCK>`**
+  — scalar block kernel. Grid `(num_pbr_blocks, batch, ceil(features/FEAT_BLOCK))`.
+  Loads X into shared memory, walks the bitmask, accumulates, `atomicAdd` to Y.
+  The shared-mem partition `p` is floored to a power of two so inner `/p`,`%p`
+  become shift/mask. `TOTAL_SHARED = 2048`.
+- **`pbr_spmm_vec_kernel<…>`** — vectorized variant: each thread owns `L`
+  contiguous features via `float4`/`double2`. Used when `features % L == 0`.
+- **`csr_spmm_kernel<index_t, scalar_t>`** — the **CSR remainder** kernel
+  (warp-per-row / CSR-Vector). One warp owns a row across all features, loading
+  the row's structure once and reusing it across feature tiles. Replaced the old
+  per-nnz COO kernel (~16× fewer L2/DRAM passes at features=512).
 
-### `coo_spmm_kernel<scalar_t>` *(added for remainder)*
-Processes the COO remainder. Grid = `(nnz, batch_size, ceil(features/128))`.
-- Each block handles one nonzero element across all features.
-- `atomicAdd(&Y[row * features + feat], val * X[col * features + feat])`.
-- Row/col arrays are always `int32_t`.
-
-### Launchers
-- `launch_pbr_spmm<index_t, scalar_t>(...)` — dispatches to the right block-size template; takes a `cudaStream_t stream` param.
-- `launch_coo_spmm<scalar_t>(...)` — launches the COO kernel; takes a `cudaStream_t stream` param.
+Launchers: `launch_pbr_spmm` (picks vec vs scalar by `features % L`; `block_codes`
+is `const int64_t*`) and `launch_csr_spmm`. Both take a `cudaStream_t`.
 
 ---
 
 ## Wrapper layer (`bindings/bindings_kernels.cu`)
 
-### `pbr_full_spmm_cuda_wrapper<index_t, scalar_t>`
-The main entry point called from Python. Does:
-1. Creates two CUDA streams (`s_blocks`, `s_coo`).
-2. Launches `launch_pbr_spmm` on `s_blocks`.
-3. Launches `launch_coo_spmm` on `s_coo` (skipped if `rem_nnz == 0`).
-4. `cudaStreamSynchronize` on both, then destroys them.
+### `pbr_spmm_cuda_dispatch<index_t, scalar_t>(...) -> at::Tensor`
+Main SpMM entry point. **Allocates and returns Y** (`[batch, rows, features]`).
+Runs the block kernel and the CSR-remainder kernel on two **ATen stream-pool**
+streams that fork from / rejoin the caller's current stream via CUDA events.
+Exposed as `core.pbr_spmm_cuda_i32_f32 / i64_f32 / i32_f64 / i64_f64`.
 
-Exposed to Python as:
-```
-core.pbr_full_spmm_cuda_int32_float
-core.pbr_full_spmm_cuda_int64_float
-core.pbr_full_spmm_cuda_int32_double
-core.pbr_full_spmm_cuda_int64_double
-```
+The PPR kernels are also bound here (`init_ppr_cuda_*`, `missing_mass_cuda_*`,
+`ppr_update_cuda_*`, `ppr_update_normalized_cuda_*`).
+
+`bindings.cpp` exposes the matrix to Python via **property getters**
+(`block_codes` as a uint64 array through `.to_ulong()`, flat `block_coords`,
+`block_offsets`, `block_data`, `remainder_indptr`, `remainder_col_ind`,
+`remainder_data`) plus `__copy__` (needed by the Python `.to()`), and
+`accounted_blocks` / `compressed_nnz` / `remainder_nnz`. There is no `to_dict()`.
 
 ---
 
 ## Python API (`graph_link/__init__.py`)
 
 ### GPU metadata cache (`pbr_registry.py`)
-When a PBR matrix is moved to GPU via `.to('cuda')`, its metadata is extracted and stored as PyTorch CUDA tensors in a global dict keyed by `id(pbr_mat)`:
+`.to('cuda')` reads the matrix's property getters and stores CUDA tensors keyed
+by `id(pbr_mat)`:
 
 ```python
 {
-    'codes':    int64  tensor  # block bitmasks (reinterpreted as uint64 in C++)
-    'coords':   int32  tensor  # flattened [row0, col0, row1, col1, …]
-    'offsets':  int32  tensor  # per-block start index into data
-    'data':     float32/64     # packed block nonzero values
-    'rem_rows': int32  tensor  # COO remainder row indices
-    'rem_cols': int32  tensor  # COO remainder col indices
-    'rem_vals': float32/64     # COO remainder values
+    'codes':       int64  tensor,  # block bitmasks (read as int64_t in C++)
+    'coords':      int32  tensor,  # flat [row0, col0, row1, col1, …]
+    'offsets':     int32  tensor,  # per-block start index into data
+    'data':        float32/64,     # packed block nonzeros
+    'rem_indptr':  int32  tensor,  # CSR remainder row pointers (rows+1)
+    'rem_col_ind': int32  tensor,  # CSR remainder column indices
+    'rem_vals':    float32/64,     # CSR remainder values
 }
 ```
 
-### `csr_to_pbr(mat, block_rows=8, block_cols=8, min_nnz_per_block=1)`
-Accepts `scipy.sparse.csr_matrix` or a CPU `torch.Tensor` (sparse CSR). Returns a `pbr_matrix_t` C++ object.
+### `csr_to_pbr(mat, block_rows=8, block_cols=8, min_nnz_per_block=4)`
+`scipy.sparse.csr_matrix` or a CPU sparse-CSR `torch.Tensor` → `pbr_matrix_t`.
 
-### `pbr_matmul(pbr_mat, x: Tensor) → Tensor`
-Unified entry point. Dispatches to GPU path (via `pbr_batched_matmul_cuda`) or CPU path. Handles 2D/3D input shapes.
+### `pbr_matmul(pbr_mat, x: Tensor) -> Tensor`
+Unified entry. GPU path calls `pbr_batched_matmul_cuda` (returns Y); CPU path
+calls `core.pbr_batched_matmul_cpu(pbr_mat, x)` (also returns a tensor). Squeezes
+the batch dim for 2D input.
 
-### `pbr_batched_matmul_cuda(pbr_mat, x, y, batch_size, features)`
-Dispatches to the correct `core.pbr_full_spmm_cuda_*` variant based on `meta['coords'].dtype` and `meta['data'].dtype`. Passes both the block and remainder tensors.
+### `pbr_batched_matmul_cuda(pbr_mat, x) -> Tensor`
+Selects the `core.pbr_spmm_cuda_*` variant by `meta` dtypes and returns
+`Y = A @ x` (`[batch, rows, features]`). Passes block + CSR-remainder tensors.
 
-### `normalize_transition_matrix(A_csr) → sp.csr_matrix`
-Column-normalizes A for PPR. Non-zero columns divided by their sum. Dangling columns (sum=0) get uniform 1/N. Call this before `csr_to_pbr` when using `run_personalized_pagerank`.
+### `normalize_transition_matrix(A_csr) -> sp.csr_matrix`
+Column-stochastic normalization for PPR (dangling columns → uniform 1/N). Call
+before `csr_to_pbr` when using `run_personalized_pagerank`.
 
-### `run_personalized_pagerank(pbr_mat, source_nodes, alpha=0.85, max_iterations=100, tolerance=1e-6)`
-Power-iteration PPR: **X_{t+1} = α · A @ X_t + (1−α) · e_s**
-- Requires `pbr_mat.to('cuda')` and a column-stochastic matrix (use `normalize_transition_matrix` first)
-- Per iteration: `Y.zero_()` → SpMM → `ppr_update_normalized` (in-place, no col_sums, no missing_mass)
-- Early exit when `max(errors) < tolerance`; returns `(X, iterations_run, converged)`
-
----
-
-## `to_dict()` method (`pbr_matrix.hpp`)
-Called by `_pbr_to_method` to extract all GPU-transferable arrays as numpy arrays:
-- `block_codes`, `block_coords`, `block_offsets`, `block_data` — compressed block data
-- `rem_rows`, `rem_cols`, `rem_vals` — remainder COO (may be empty arrays)
+### `run_personalized_pagerank(pbr_mat, source_nodes, alpha=0.85, max_iterations=100, tolerance=1e-6, return_history=False)`
+Power iteration **X_{t+1} = α·A@X_t + (1−α)·e_s** (column-stochastic A, one
+column per source). Each step allocates a fresh Y (the dispatch returns it).
+Returns `(X, iterations, converged)`, or `(X, iterations, converged, history)`
+when `return_history=True` — `history[t]` is the per-iteration max L1 update
+error (used by the frontend convergence chart; free, reuses the existing sync).
 
 ---
 
 ## Template instantiation matrix
 
-| `index_t` | `scalar_t` | Python name suffix |
-|---|---|---|
-| `int32_t` | `float` | `int32_float` |
-| `int64_t` | `float` | `int64_float` |
-| `int32_t` | `double` | `int32_double` |
-| `int64_t` | `double` | `int64_double` |
-
-In practice, Python always casts coords/offsets/rem_rows/rem_cols to **int32**, so the `int32_*` variants are always selected.
+`{int32_t, int64_t} × {float, double}` → suffixes `i32_f32`, `i64_f32`,
+`i32_f64`, `i64_f64`. Python uploads coords/offsets/remainder indices as
+**int32**, so the `i32_*` variants are selected in practice (block_codes are
+always read as int64).
 
 ---
 
 ## Tests
 
 ```
-Tests/test_spmm.py
+pytest Tests/test_spmm.py -v          # SpMM vs scipy
+pytest Tests/test_ppr_accuracy.py -v  # PPR vs NetworkX
 ```
 
-Single parametrized test `test_spmm_accuracy` covering:
-- `N` ∈ {64, 128, 1024}
-- `num_features` ∈ {8, 64, 256}
-- `density` ∈ {0.05, 0.15}
-- `block_size` ∈ {2, 4, 8} (rows == cols)
-- `min_nnz` ∈ {1, 4}
-
-Run with: `pytest Tests/test_spmm.py -v`
-
-The `min_nnz=4` cases are the critical ones — they put significant data into `remainder_coo` and verify the COO kernel is working.
+The `min_nnz=4` cases push significant mass into the **CSR remainder** and
+exercise `csr_spmm_kernel`. See `Tests/CLAUDE.md`.
 
 ---
 
 ## Known design decisions
 
-- **`min_nnz=1` vs `min_nnz=4`**: With `min_nnz=1`, almost all elements end up in compressed blocks and the remainder is tiny. With `min_nnz=4`, blocks with 1–3 nnz fall into the remainder, which can be substantial for sparse matrices. With `block_size=2, min_nnz=4` on a sparse matrix, `accounted_blocks()` can be **0** — `launch_pbr_spmm` guards against this with an early return to avoid launching a CUDA kernel with `grid.x=0` (invalid configuration).
-- **Stream creation per call**: `pbr_full_spmm_cuda_wrapper` creates and destroys CUDA streams on every call. This is simple but has per-call overhead. For high-frequency calls, consider caching streams in the pbr registry.
-- **Always int32 for COO indices**: Remainder row/col tensors are always cast to int32 on GPU transfer, consistent with how block coords are treated.
-- **`pagerank_engine.cpp`** in the root is a standalone file, not compiled into the library.
+- **`min_nnz`**: small → almost everything compressed (tiny remainder); larger →
+  blocks with few nnz fall into the CSR remainder. With `block_size=2, min_nnz=4`
+  on a sparse matrix `accounted_blocks()` can be **0** — `launch_pbr_spmm` guards
+  against a `grid.x=0` launch with an early return.
+- **Stream overlap**: `pbr_spmm_cuda_dispatch` uses the ATen stream pool + events
+  to overlap the block and CSR kernels and rejoin the caller's stream (no manual
+  `cudaStreamCreate`/`Destroy`).
+- **int32 indices on GPU**: coords/offsets/remainder indices are cast to int32 on
+  transfer; values fit int32 for the graphs in scope.
+- **`pagerank_engine.cpp`** in the root is dead code — not in the build.

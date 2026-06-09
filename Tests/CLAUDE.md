@@ -37,11 +37,11 @@ All tests require a CUDA-capable GPU. Tests are skipped automatically when CUDA 
 | `num_features` | 8, 64, 256 | Columns of the dense X matrix |
 | `density` | 0.05, 0.15 | Fraction of nonzeros in A |
 | `block_size` | 2, 4, 8 | Block tile size (rows == cols) |
-| `min_nnz` | 1, 4 | Min nnz per block to use compressed format; lower threshold → more goes to remainder_coo |
+| `min_nnz` | 1, 4 | Min nnz per block to use compressed format; higher threshold → more goes to the CSR remainder |
 
 **Tolerance**: `atol=1e-4` (float32 accumulation error).
 
-**Critical cases**: `min_nnz=4` exercises the COO remainder kernel heavily, especially for sparse matrices and small block sizes.
+**Critical cases**: `min_nnz=4` exercises the CSR remainder kernel heavily, especially for sparse matrices and small block sizes.
 
 ---
 
@@ -90,7 +90,7 @@ All tests require a CUDA-capable GPU. Tests are skipped automatically when CUDA 
 | Test | Backend | Notes |
 |---|---|---|
 | `test_benchmark_torch_ppr` | `torch.sparse.mm` (cuSPARSE) | Baseline; runs 100 PPR iterations, simplified update `X = α·A@X + (1-α)·e_s`, no convergence check |
-| `test_benchmark_pbr_engine` | `run_personalized_pagerank` (custom CUDA) | PBR block + COO remainder kernels; two CUDA streams in parallel |
+| `test_benchmark_pbr_engine` | `run_personalized_pagerank` (custom CUDA) | PBR block + CSR remainder kernels; two CUDA streams in parallel |
 
 Both backends operate on the same column-stochastic matrix produced by `normalize_transition_matrix`, ensuring a fair comparison.
 
