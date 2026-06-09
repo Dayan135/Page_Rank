@@ -7,24 +7,47 @@ void bind_cuda_functions(py::module_& m);
 #endif
 
 #define BIND_PBR_MATRIX_CLASS(T, S, py_name) \
-        py::class_<pbr_matrix_t<T,S>>(m, (py_name)) \
+        py::class_<pbr_matrix_t<T,S>>(m, (py_name), py::dynamic_attr()) \
             .def_readonly("rows", &pbr_matrix_t<T, S>::rows) \
             .def_readonly("cols", &pbr_matrix_t<T, S>::cols) \
             .def_readonly("block_rows", &pbr_matrix_t<T, S>::block_rows) \
             .def_readonly("block_cols", &pbr_matrix_t<T, S>::block_cols) \
             .def_readonly("total_nnz", &pbr_matrix_t<T, S>::total_nnz) \
-            .def_readonly("block_codes", &pbr_matrix_t<T, S>::block_codes) \
-            .def_readonly("block_coords", &pbr_matrix_t<T, S>::block_coords) \
             .def_readonly("data_order", &pbr_matrix_t<T, S>::data_order) \
-            .def_readonly("block_data", &pbr_matrix_t<T, S>::block_data) \
-            .def_readonly("remainder_coo", &pbr_matrix_t<T, S>::remainder_coo) \
-            .def_readonly("block_offsets", &pbr_matrix_t<T, S>::block_offsets) \
+            .def_property_readonly("block_codes", [](const pbr_matrix_t<T, S>& self) { \
+                py::array_t<uint64_t> arr(self.block_codes.size()); \
+                auto ptr = arr.mutable_data(); \
+                for (size_t i = 0; i < self.block_codes.size(); ++i) ptr[i] = self.block_codes[i].to_ulong(); \
+                return arr; \
+            }) \
+            .def_property_readonly("block_coords", [](const pbr_matrix_t<T, S>& self) { \
+                py::array_t<T> arr(self.block_coords.size() * 2); \
+                auto ptr = arr.mutable_data(); \
+                for (size_t i = 0; i < self.block_coords.size(); ++i) { \
+                    ptr[i * 2]     = self.block_coords[i].row; \
+                    ptr[i * 2 + 1] = self.block_coords[i].col; \
+                } \
+                return arr; \
+            }) \
+            .def_property_readonly("block_offsets", [](const pbr_matrix_t<T, S>& self) { \
+                return py::array_t<T>(self.block_offsets.size(), self.block_offsets.data()); \
+            }) \
+            .def_property_readonly("block_data", [](const pbr_matrix_t<T, S>& self) { \
+                return py::array_t<S>(self.block_data.size(), self.block_data.data()); \
+            }) \
+            .def_property_readonly("remainder_indptr", [](const pbr_matrix_t<T, S>& self) { \
+                return py::array_t<T>(self.remainder_indptr.size(), self.remainder_indptr.data()); \
+            }) \
+            .def_property_readonly("remainder_col_ind", [](const pbr_matrix_t<T, S>& self) { \
+                return py::array_t<T>(self.remainder_col_ind.size(), self.remainder_col_ind.data()); \
+            }) \
+            .def_property_readonly("remainder_data", [](const pbr_matrix_t<T, S>& self) { \
+                return py::array_t<S>(self.remainder_vals.size(), self.remainder_vals.data()); \
+            }) \
             .def("__copy__", [](const pbr_matrix_t<T, S> &self) { return pbr_matrix_t<T, S>(self); }) \
-            .def("to_dict", &pbr_matrix_t<T, S>::to_dict) \
             .def("accounted_blocks", &pbr_matrix_t<T, S>::accounted_blocks) \
             .def("compressed_nnz", &pbr_matrix_t<T, S>::compressed_nnz) \
-            .def("remainder_nnz", &pbr_matrix_t<T, S>::remainder_nnz);// \
-//            .def("to_csr", &pbr_matrix_t<T, S>::to_csr);
+            .def("remainder_nnz", &pbr_matrix_t<T, S>::remainder_nnz);
 
 PYBIND11_MODULE(graph_link_core, m) {
     py::enum_<data_order_t>(m, "DataOrder")

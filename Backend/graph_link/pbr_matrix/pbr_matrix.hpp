@@ -1,24 +1,17 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
+#include <ATen/ATen.h>
 
 namespace py = pybind11;
 
 #include <bitset>
 #include <unordered_map>
 #include <vector>
+#include <cstdint> 
 
-//bitmap
-#include <cstdint> // Required for uint64_t
-
-// Use raw uint64_t for the bitmask.
 #define BITS_PER_CODE 64
-// This allows dynamic block sizes (4x4, 8x4, 8x8, etc.)
-// as long as block_rows * block_cols <= 64.
-typedef uint64_t block_code_t;
-
-// #define BITS_PER_CODE 64
-// typedef std::bitset<BITS_PER_CODE> block_code_t;
+typedef std::bitset<BITS_PER_CODE> block_code_t;
 
 template <typename index_t>
 struct coord_t {
@@ -65,10 +58,7 @@ struct pbr_stats_t {
     } block_descriptor_t;
 
     typedef std::unordered_map<index_t, block_code_t> block_code_map;
-
-    //bitmap
-    typedef std::unordered_map<block_code_t, block_descriptor_t> block_stats_map;
-    // typedef std::unordered_map<index_t, block_descriptor_t> block_stats_map;
+    typedef std::unordered_map<index_t, block_descriptor_t> block_stats_map;
 
     const index_t rows;
     const index_t cols;
@@ -108,7 +98,6 @@ enum data_order_t {
 template <typename index_t, typename scalar_t>
 struct pbr_matrix_t {
     typedef struct coord_t<index_t> coord_t;
-    typedef struct coo_elem_t<index_t, scalar_t> coo_elem_t;
 
     // Number of rows and columns in the matrix
     const index_t rows;
@@ -135,9 +124,11 @@ struct pbr_matrix_t {
     const data_order_t data_order;
     const std::vector<scalar_t> block_data;
 
-    // Elements belonging to blocks that are not compressed.
-    // These elements are stored in COO format.
-    const std::vector<coo_elem_t> remainder_coo;
+    // Elements belonging to blocks that are not compressed, stored in CSR format.
+    // remainder_indptr has size rows+1; remainder_col_ind and remainder_vals have size remainder_nnz().
+    const std::vector<index_t> remainder_indptr;
+    const std::vector<index_t> remainder_col_ind;
+    const std::vector<scalar_t> remainder_vals;
 
     pbr_matrix_t(const index_t rows, const index_t cols,
                  const index_t block_rows, const index_t block_cols,
@@ -147,7 +138,9 @@ struct pbr_matrix_t {
                  const std::vector<index_t>&& block_offsets,
                  const data_order_t data_order,
                  const std::vector<scalar_t>&& block_data,
-                 const std::vector<coo_elem_t>&& remainder_coo) :
+                 const std::vector<index_t>&& remainder_indptr,
+                 const std::vector<index_t>&& remainder_col_ind,
+                 const std::vector<scalar_t>&& remainder_vals) :
                 rows(rows), cols(cols),
                 block_rows(block_rows), block_cols(block_cols),
                 total_nnz(total_nnz),
@@ -156,7 +149,9 @@ struct pbr_matrix_t {
                 block_offsets(std::move(block_offsets)),
                 data_order(data_order),
                 block_data(std::move(block_data)),
-                remainder_coo(std::move(remainder_coo)) {}
+                remainder_indptr(std::move(remainder_indptr)),
+                remainder_col_ind(std::move(remainder_col_ind)),
+                remainder_vals(std::move(remainder_vals)) {}
 
     const index_t accounted_blocks() const {
         return block_codes.size();
@@ -167,40 +162,13 @@ struct pbr_matrix_t {
     }
 
     const index_t remainder_nnz() const {
-        return remainder_coo.size();
-    }
-
-    // NEW: Method to package metadata for loading into GPU
-    py::dict to_dict() const {
-        py::dict d;
-        d["block_codes"] = py::array_t<block_code_t>(block_codes.size(), block_codes.data());
-        // Flattening coords to a simple array for easier GPU transfer: [r0, c0, r1, c1...]
-        d["block_coords"] = py::array_t<index_t>(block_coords.size() * 2, (index_t*)block_coords.data());
-        d["block_offsets"] = py::array_t<index_t>(block_offsets.size(), block_offsets.data());
-        d["block_data"] = py::array_t<scalar_t>(block_data.size(), block_data.data());
-
-        // Remainder COO — exported as three flat arrays for GPU transfer
-        const size_t rem_nnz = remainder_coo.size();
-        std::vector<index_t>  r_rows(rem_nnz), r_cols(rem_nnz);
-        std::vector<scalar_t> r_vals(rem_nnz);
-        for (size_t i = 0; i < rem_nnz; ++i) {
-            r_rows[i] = remainder_coo[i].row;
-            r_cols[i] = remainder_coo[i].col;
-            r_vals[i] = remainder_coo[i].val;
-        }
-        d["rem_rows"] = py::array_t<index_t> (rem_nnz, r_rows.data());
-        d["rem_cols"] = py::array_t<index_t> (rem_nnz, r_cols.data());
-        d["rem_vals"] = py::array_t<scalar_t>(rem_nnz, r_vals.data());
-        return d;
+        return remainder_col_ind.size();
     }
 };
 
 template <typename index_t, typename scalar_t>
-void pbr_batched_matmul_cpu(const pbr_matrix_t<index_t, scalar_t>& pbr_mat,
-                            const py::array_t<scalar_t, py::array::c_style> x,
-                            py::array_t<scalar_t, py::array::c_style> y,
-                            const int batch_size,
-                            const int width);
+at::Tensor pbr_batched_matmul_cpu(const pbr_matrix_t<index_t, scalar_t>& pbr_mat,
+                                   at::Tensor x);
 
 template <typename index_t, typename scalar_t>
 pbr_matrix_t<index_t, scalar_t> csr_to_pbr(const py::array_t<index_t, py::array::c_style> indptr,

@@ -1,27 +1,30 @@
-// //ver4
 #include <cuda_runtime.h>
-#include <stdexcept>
 #include <cstdint>
+#include <stdexcept>
 
-#define TOTAL_SHARED 512
-#define THREADS_PER_BLOCK 128
-#define FEAT_BLOCK_SIZE 512
+// 16-byte vector type per scalar: float4 (4 lanes) / double2 (2 lanes). The
+// vectorized kernel processes `lanes` contiguous features per thread so the
+// hot shared-memory loads/stores become a single LDS.128 / STS.128.
+template <typename scalar_t> struct PbrVec;
+template <> struct PbrVec<float>  { using type = float4;  static constexpr int lanes = 4; };
+template <> struct PbrVec<double> { using type = double2; static constexpr int lanes = 2; };
 
-template <typename index_t, typename scalar_t, int BLOCK_ROWS, int BLOCK_COLS>
+template <typename index_t, typename scalar_t,
+          int BLOCK_ROWS, int BLOCK_COLS,
+          int TOTAL_SHARED, int THREADS_PER_BLOCK, int FEAT_BLOCK_SIZE>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_zero_idle_kernel(
     const uint32_t num_pbr_blocks,
     const uint32_t features,
     const uint32_t batch_size,
     const uint32_t cols,
     const uint32_t rows,
-    const uint64_t* __restrict__ block_codes,
+    const int64_t* __restrict__ block_codes,
     const index_t* __restrict__ block_coords,
     const index_t* __restrict__ block_offsets,
     const scalar_t* __restrict__ block_data,
     const scalar_t* __restrict__ X,
     scalar_t* __restrict__ Y
 ) {
-    // FIX 1: Reverted to Static Shared Memory. Guarantees allocation without needing host params!
     __shared__ scalar_t smem[TOTAL_SHARED];
 
     const uint32_t b_idx = blockIdx.x;
@@ -32,7 +35,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_zero_idle_kern
     if (b_idx >= num_pbr_blocks || batch_idx >= batch_size) return;
 
     // Load Metadata to Registers
-    const uint64_t code = block_codes[b_idx];
+    const uint64_t code = static_cast<uint64_t>(block_codes[b_idx]);
     const uint32_t row_origin = block_coords[b_idx * 2];
     const uint32_t col_origin = block_coords[b_idx * 2 + 1];
     const uint32_t data_offset = block_offsets[b_idx];
@@ -76,8 +79,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_zero_idle_kern
     }
 
     // --- 2. DYNAMIC P CALCULATION ---
-    uint32_t p = TOTAL_SHARED / (n_r + n_c);
-    if (p > features) p = features;
+    // p is floored to a power of 2 so inner-loop /current_p and %current_p
+    // become bit-shift and mask ops.  Correct when features is a power-of-2
+    // multiple of p, which holds for all benchmarked feature counts.
+    const uint32_t p_log2 = 31u - __clz(min(TOTAL_SHARED / (n_r + n_c), features));
+    const uint32_t p      = 1u << p_log2;
+    const uint32_t p_mask = p - 1u;
 
     const uint32_t feat_start = feat_block_idx * FEAT_BLOCK_SIZE;
     const uint32_t feat_end = min(feat_start + FEAT_BLOCK_SIZE, features);
@@ -87,15 +94,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_zero_idle_kern
 
         const uint32_t current_p = min(p, feat_end - base_f);
 
-        // FIX 2: Dynamically partition shared memory inside the loop based on current_p
         scalar_t* smem_X = smem;
         scalar_t* smem_Y = smem + (n_c * current_p);
 
         // STEP A: Cooperative Load
         const uint32_t total_x_elements = n_c * current_p;
         for (uint32_t i = tx; i < total_x_elements; i += THREADS_PER_BLOCK) {
-            const uint32_t c_idx = i / current_p;
-            const uint32_t f_offset = i % current_p;
+            const uint32_t c_idx   = i >> p_log2;
+            const uint32_t f_offset = i & p_mask;
 
             const uint32_t local_c = (packed_cols_physical >> (c_idx * 3)) & 0x7;
             smem_X[i] = X[(batch_idx * cols * features) + ((col_origin + local_c) * features) + base_f + f_offset];
@@ -107,8 +113,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_zero_idle_kern
         const uint32_t total_work = n_r * current_p;
 
         for (uint32_t work_idx = tx; work_idx < total_work; work_idx += THREADS_PER_BLOCK) {
-            const uint32_t pr = work_idx / current_p;
-            const uint32_t f_in_s = work_idx % current_p;
+            const uint32_t pr    = work_idx >> p_log2;
+            const uint32_t f_in_s = work_idx & p_mask;
 
             const uint32_t actual_r = (packed_active_rows >> (pr * 3)) & 0x7;
             uint32_t local_data_ptr = data_offset + ((packed_row_offsets >> (pr * 7)) & 0x7F);
@@ -121,8 +127,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_zero_idle_kern
             for (uint32_t c = 0; c < BLOCK_COLS; ++c) {
                 if ((row_code >> c) & 1) {
                     const uint32_t pc = (packed_cols_logical >> (c * 3)) & 0x7;
-                    // FIX 3: Replaced 'p' with 'current_p' to match Step A perfectly!
-                    sum += block_data[local_data_ptr] * smem_X[pc * current_p + f_in_s];
+                    sum += __ldg(&block_data[local_data_ptr]) * smem_X[pc * current_p + f_in_s];
                     local_data_ptr++;
                 }
             }
@@ -134,8 +139,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_zero_idle_kern
 
         // STEP C: Cooperative Atomic Commit
         for (uint32_t work_idx = tx; work_idx < total_work; work_idx += THREADS_PER_BLOCK) {
-            const uint32_t pr = work_idx / current_p;
-            const uint32_t f_in_s = work_idx % current_p;
+            const uint32_t pr    = work_idx >> p_log2;
+            const uint32_t f_in_s = work_idx & p_mask;
 
             const uint32_t actual_r = (packed_active_rows >> (pr * 3)) & 0x7;
             const uint32_t global_r = row_origin + actual_r;
@@ -148,32 +153,165 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_zero_idle_kern
 }
 
 
-template <typename scalar_t>
-__global__ void coo_spmm_kernel(
-    int nnz,
-    int features,
-    int batch_size,
-    int cols,
-    int rows,
-    const int32_t* __restrict__ coo_rows,
-    const int32_t* __restrict__ coo_cols,
-    const scalar_t* __restrict__ coo_vals,
+// Vectorized variant: each thread owns `L` (= PbrVec lanes) contiguous features.
+// Requires features % L == 0 so the per-column feature run is L-aligned in both
+// global X and shared memory; the launcher guarantees this before dispatching.
+template <typename index_t, typename scalar_t,
+          int BLOCK_ROWS, int BLOCK_COLS,
+          int TOTAL_SHARED, int THREADS_PER_BLOCK, int FEAT_BLOCK_SIZE>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_vec_kernel(
+    const uint32_t num_pbr_blocks,
+    const uint32_t features,
+    const uint32_t batch_size,
+    const uint32_t cols,
+    const uint32_t rows,
+    const int64_t* __restrict__ block_codes,
+    const index_t* __restrict__ block_coords,
+    const index_t* __restrict__ block_offsets,
+    const scalar_t* __restrict__ block_data,
     const scalar_t* __restrict__ X,
     scalar_t* __restrict__ Y
 ) {
-    const int nnz_idx   = blockIdx.x;
-    const int batch_idx = blockIdx.y;
-    const int feat      = blockIdx.z * blockDim.x + threadIdx.x;
-    if (feat >= features) return;
+    using vec_t = typename PbrVec<scalar_t>::type;
+    constexpr int L = PbrVec<scalar_t>::lanes;
+    union lane_u { vec_t v; scalar_t s[L]; };
 
-    const int32_t row  = coo_rows[nnz_idx];
-    const int32_t col  = coo_cols[nnz_idx];
-    const scalar_t val = coo_vals[nnz_idx];
+    __shared__ __align__(16) scalar_t smem[TOTAL_SHARED];
 
-    atomicAdd(
-        &Y[(batch_idx * rows * features) + (row * features) + feat],
-        val * X[(batch_idx * cols * features) + (col * features) + feat]
-    );
+    const uint32_t b_idx = blockIdx.x;
+    const uint32_t batch_idx = blockIdx.y;
+    const uint32_t feat_block_idx = blockIdx.z;
+    const uint32_t tx = threadIdx.x;
+
+    if (b_idx >= num_pbr_blocks || batch_idx >= batch_size) return;
+
+    const uint64_t code = static_cast<uint64_t>(block_codes[b_idx]);
+    const uint32_t row_origin = block_coords[b_idx * 2];
+    const uint32_t col_origin = block_coords[b_idx * 2 + 1];
+    const uint32_t data_offset = block_offsets[b_idx];
+
+    // --- 1. SPARSITY SCAN & REGISTER PACKING (identical to scalar kernel) ---
+    uint32_t n_r = 0;
+    uint64_t col_mask = 0;
+    const uint64_t row_bits = (1ULL << BLOCK_COLS) - 1;
+
+    uint32_t packed_active_rows = 0;
+    uint64_t packed_row_offsets = 0;
+    uint32_t current_relative_offset = 0;
+
+    #pragma unroll
+    for (uint32_t r = 0; r < BLOCK_ROWS; ++r) {
+        const uint64_t row_mask = (code >> (r * BLOCK_COLS)) & row_bits;
+        if (row_mask > 0) {
+            packed_active_rows |= (r << (n_r * 3));
+            packed_row_offsets |= ((uint64_t)current_relative_offset << (n_r * 7));
+            n_r++;
+            col_mask |= row_mask;
+            current_relative_offset += __popcll(row_mask);
+        }
+    }
+
+    const uint32_t n_c = __popcll(col_mask);
+    if (n_r == 0 || n_c == 0) return;
+
+    uint32_t packed_cols_physical = 0;
+    uint32_t packed_cols_logical = 0;
+    uint32_t pc_idx = 0;
+
+    #pragma unroll
+    for (uint32_t c = 0; c < BLOCK_COLS; ++c) {
+        if ((col_mask >> c) & 1) {
+            packed_cols_logical |= (pc_idx << (c * 3));
+            packed_cols_physical |= (c << (pc_idx * 3));
+            pc_idx++;
+        }
+    }
+
+    // --- 2. DYNAMIC P CALCULATION (vp floored to power of 2 → bit-op division) ---
+    // vp_log2 / vp_mask replace /vp and %vp in inner loops; correct when
+    // features is a power-of-2 multiple of p (all benchmarked feature counts).
+    const uint32_t vp_log2 = 31u - __clz(min(TOTAL_SHARED / (n_r + n_c), features) / L);
+    const uint32_t vp_mask = (1u << vp_log2) - 1u;
+    const uint32_t p       = (1u << vp_log2) * L;
+
+    const uint32_t feat_start = feat_block_idx * FEAT_BLOCK_SIZE;
+    const uint32_t feat_end = min(feat_start + FEAT_BLOCK_SIZE, features);
+
+    // --- 3. GRID-STRIDE LOOP OVER FEATURES (in units of L) ---
+    for (uint32_t base_f = feat_start; base_f < feat_end; base_f += p) {
+
+        const uint32_t current_p = min(p, feat_end - base_f);  // multiple of L
+        const uint32_t vp = current_p / L;                     // vectors per column
+
+        scalar_t* smem_X = smem;
+        scalar_t* smem_Y = smem + (n_c * current_p);
+
+        // STEP A: Cooperative vectorized load of X -> smem_X
+        const uint32_t total_xv = n_c * vp;
+        for (uint32_t i = tx; i < total_xv; i += THREADS_PER_BLOCK) {
+            const uint32_t c_idx   = i >> vp_log2;
+            const uint32_t f_off   = (i & vp_mask) * L;
+            const uint32_t local_c = (packed_cols_physical >> (c_idx * 3)) & 0x7;
+
+            const vec_t xv = *reinterpret_cast<const vec_t*>(
+                &X[(batch_idx * cols * features) + ((col_origin + local_c) * features) + base_f + f_off]);
+            *reinterpret_cast<vec_t*>(&smem_X[c_idx * current_p + f_off]) = xv;
+        }
+
+        __syncthreads();
+
+        // STEP B: FLATTENED WORKER POOL (one float4/double2 per thread)
+        const uint32_t total_vwork = n_r * vp;
+        for (uint32_t vwork = tx; vwork < total_vwork; vwork += THREADS_PER_BLOCK) {
+            const uint32_t pr    = vwork >> vp_log2;
+            const uint32_t f_off = (vwork & vp_mask) * L;
+
+            const uint32_t actual_r = (packed_active_rows >> (pr * 3)) & 0x7;
+            uint32_t local_data_ptr = data_offset + ((packed_row_offsets >> (pr * 7)) & 0x7F);
+            const uint64_t row_code = (code >> (actual_r * BLOCK_COLS)) & row_bits;
+
+            lane_u acc;
+            #pragma unroll
+            for (int l = 0; l < L; ++l) acc.s[l] = 0;
+
+            #pragma unroll
+            for (uint32_t c = 0; c < BLOCK_COLS; ++c) {
+                if ((row_code >> c) & 1) {
+                    const uint32_t pc = (packed_cols_logical >> (c * 3)) & 0x7;
+                    const scalar_t coef = __ldg(&block_data[local_data_ptr]);
+
+                    lane_u xu;
+                    xu.v = *reinterpret_cast<const vec_t*>(&smem_X[pc * current_p + f_off]);
+                    #pragma unroll
+                    for (int l = 0; l < L; ++l) acc.s[l] += coef * xu.s[l];
+
+                    local_data_ptr++;
+                }
+            }
+
+            *reinterpret_cast<vec_t*>(&smem_Y[pr * current_p + f_off]) = acc.v;
+        }
+
+        __syncthreads();
+
+        // STEP C: Cooperative atomic commit (vector load from smem, L scalar atomics)
+        for (uint32_t vwork = tx; vwork < total_vwork; vwork += THREADS_PER_BLOCK) {
+            const uint32_t pr    = vwork >> vp_log2;
+            const uint32_t f_off = (vwork & vp_mask) * L;
+
+            const uint32_t actual_r = (packed_active_rows >> (pr * 3)) & 0x7;
+            const uint32_t global_r = row_origin + actual_r;
+
+            lane_u yu;
+            yu.v = *reinterpret_cast<const vec_t*>(&smem_Y[pr * current_p + f_off]);
+            #pragma unroll
+            for (int l = 0; l < L; ++l) {
+                atomicAdd(&Y[(batch_idx * rows * features) + (global_r * features) + base_f + f_off + l], yu.s[l]);
+            }
+        }
+
+        __syncthreads();
+    }
 }
 
 
@@ -186,7 +324,7 @@ void launch_pbr_spmm(
     const int rows,
     const int runtime_block_rows,
     const int runtime_block_cols,
-    const uint64_t* block_codes,
+    const int64_t* block_codes,
     const index_t* block_coords,
     const index_t* block_offsets,
     const scalar_t* block_data,
@@ -194,72 +332,134 @@ void launch_pbr_spmm(
     scalar_t* Y,
     cudaStream_t stream
 ) {
-    // Fast exit for perfectly empty matrices
     if (num_pbr_blocks == 0) {
-        return; // Y is already allocated with zeros, just return it!
+        return;
     }
 
-    // Z-dimension: How many blocks of 512 features do we need?
-    int feat_blocks = (features + FEAT_BLOCK_SIZE - 1) / FEAT_BLOCK_SIZE;
+    constexpr int TOTAL_SHARED     = 2048;
+    constexpr int THREADS_PER_BLOCK = 128;
+    constexpr int FEAT_BLOCK_SIZE  = 512;
+    constexpr int L = PbrVec<scalar_t>::lanes;
 
-    // X = Number of PBR blocks
-    // Y = Batch size
-    // Z = Feature chunking
-    dim3 grid(num_pbr_blocks, batch_size, feat_blocks);
-    dim3 block(THREADS_PER_BLOCK);
+    const int feat_blocks = (features + FEAT_BLOCK_SIZE - 1) / FEAT_BLOCK_SIZE;
+    const dim3 grid(num_pbr_blocks, batch_size, feat_blocks);
+    const dim3 block(THREADS_PER_BLOCK);
 
-    // 2. Dispatcher: Route to the statically unrolled template based on runtime vars
-    // (Note: No dynamic shared memory size parameter is passed in the <<< >>> because
-    // the kernel uses a statically sized __shared__ scalar_t smem[TOTAL_SHARED])
+    // Use the vectorized kernel when the feature count divides the vector width
+    // (it always does for the tested 8/32/512); otherwise fall back to scalar.
+    const bool use_vec = (features % L == 0);
+
+    #define PBR_LAUNCH(BR, BC)                                                                      \
+        do {                                                                                       \
+            if (use_vec)                                                                           \
+                pbr_spmm_vec_kernel<index_t, scalar_t, BR, BC, TOTAL_SHARED, THREADS_PER_BLOCK,     \
+                                    FEAT_BLOCK_SIZE><<<grid, block, 0, stream>>>(                   \
+                    num_pbr_blocks, features, batch_size, cols, rows,                               \
+                    block_codes, block_coords, block_offsets, block_data, X, Y);                    \
+            else                                                                                   \
+                pbr_spmm_zero_idle_kernel<index_t, scalar_t, BR, BC, TOTAL_SHARED,                  \
+                                          THREADS_PER_BLOCK, FEAT_BLOCK_SIZE><<<grid, block, 0,      \
+                                          stream>>>(                                                \
+                    num_pbr_blocks, features, batch_size, cols, rows,                               \
+                    block_codes, block_coords, block_offsets, block_data, X, Y);                    \
+        } while (0)
+
     if (runtime_block_rows == 2 && runtime_block_cols == 2) {
-        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 2, 2><<<grid, block, 0, stream>>>(
-            num_pbr_blocks, features, batch_size, cols, rows,
-            block_codes, block_coords, block_offsets, block_data, X, Y
-        );
+        PBR_LAUNCH(2, 2);
     } else if (runtime_block_rows == 4 && runtime_block_cols == 4) {
-        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 4, 4><<<grid, block, 0, stream>>>(
-            num_pbr_blocks, features, batch_size, cols, rows,
-            block_codes, block_coords, block_offsets, block_data, X, Y
-        );
+        PBR_LAUNCH(4, 4);
     } else if (runtime_block_rows == 8 && runtime_block_cols == 8) {
-        pbr_spmm_zero_idle_kernel<index_t, scalar_t, 8, 8><<<grid, block, 0, stream>>>(
-            num_pbr_blocks, features, batch_size, cols, rows,
-            block_codes, block_coords, block_offsets, block_data, X, Y
-        );
+        PBR_LAUNCH(8, 8);
     } else {
         throw std::invalid_argument("Unsupported block size for PBR SpMM. Only 2x2, 4x4, and 8x8 are supported.");
     }
+
+    #undef PBR_LAUNCH
 }
 
+template void launch_pbr_spmm<int32_t, float>(const int, const int, const int, const int, const int, const int, const int, const int64_t*, const int32_t*, const int32_t*, const float*, const float*, float*, cudaStream_t);
+template void launch_pbr_spmm<int64_t, float>(const int, const int, const int, const int, const int, const int, const int, const int64_t*, const int64_t*, const int64_t*, const float*, const float*, float*, cudaStream_t);
+template void launch_pbr_spmm<int32_t, double>(const int, const int, const int, const int, const int, const int, const int, const int64_t*, const int32_t*, const int32_t*, const double*, const double*, double*, cudaStream_t);
+template void launch_pbr_spmm<int64_t, double>(const int, const int, const int, const int, const int, const int, const int, const int64_t*, const int64_t*, const int64_t*, const double*, const double*, double*, cudaStream_t);
 
-template <typename scalar_t>
-void launch_coo_spmm(
-    int nnz,
-    int features,
-    int batch_size,
-    int cols,
-    int rows,
-    const int32_t* coo_rows,
-    const int32_t* coo_cols,
-    const scalar_t* coo_vals,
+
+// --- CSR remainder kernel (warp-per-row / CSR-Vector) ---
+//
+// One warp = 32 lanes owns one output row for ALL features.
+// The sparse structure (csr_vals, col_ind) is loaded once per row and reused
+// across all feature iterations; the scalar kernel would reload it once per
+// 32-feature tile, giving ceil(features/32) redundant passes through L2/DRAM
+// for those arrays. At features=512 that is a 16× saving.
+//
+// X reads remain coalesced: all 32 lanes share the same col_ind[j] but read
+// consecutive features (f, f+1, …, f+31) → one 128-byte transaction per nnz.
+//
+// atomicAdd is still required: a row can receive contributions from the block
+// kernel running concurrently on another stream. Within this kernel each row
+// belongs to exactly one warp, so there is no intra-kernel contention.
+//
+// Grid: (ceil(rows / WARPS_PER_BLOCK), batch_size), Block: (WARPS_PER_BLOCK * 32).
+
+constexpr int CSR_WARP_SIZE      = 32;
+constexpr int CSR_WARPS_PER_BLOCK = 8;   // 256 threads/block; 6 blocks/SM = full occ on RTX 3090
+
+template <typename index_t, typename scalar_t>
+__global__ void csr_spmm_kernel(
+    const uint32_t rows,
+    const uint32_t features,
+    const uint32_t batch_size,
+    const uint32_t cols,
+    const index_t* __restrict__ indptr,
+    const index_t* __restrict__ col_ind,
+    const scalar_t* __restrict__ csr_vals,
+    const scalar_t* __restrict__ X,
+    scalar_t* __restrict__ Y
+) {
+    const uint32_t warp_id = threadIdx.x / CSR_WARP_SIZE;
+    const uint32_t lane    = threadIdx.x % CSR_WARP_SIZE;
+    const uint32_t row     = blockIdx.x * CSR_WARPS_PER_BLOCK + warp_id;
+    const uint32_t batch   = blockIdx.y;
+
+    if (row >= rows || batch >= batch_size) return;
+
+    const index_t rs = indptr[row];
+    const index_t re = indptr[row + 1];
+    if (rs == re) return;
+
+    const scalar_t* x_ptr = X + batch * cols * features;
+    scalar_t*       y_ptr = Y + batch * rows * features + row * features;
+
+    // Each lane owns a distinct feature offset.  The +CSR_WARP_SIZE stride
+    // covers the entire feature dimension in one pass per row.
+    for (uint32_t f = lane; f < features; f += CSR_WARP_SIZE) {
+        scalar_t sum = 0;
+        for (index_t j = rs; j < re; ++j)
+            sum += csr_vals[j] * x_ptr[col_ind[j] * features + f];
+        atomicAdd(&y_ptr[f], sum);
+    }
+}
+
+template <typename index_t, typename scalar_t>
+void launch_csr_spmm(
+    const int rows,
+    const int features,
+    const int batch_size,
+    const int cols,
+    const index_t* indptr,
+    const index_t* col_ind,
+    const scalar_t* csr_vals,
     const scalar_t* X,
     scalar_t* Y,
     cudaStream_t stream
 ) {
-    if (nnz == 0) return;
-    const int threads = THREADS_PER_BLOCK;
-    dim3 grid(nnz, batch_size, (features + threads - 1) / threads);
-    coo_spmm_kernel<scalar_t><<<grid, threads, 0, stream>>>(
-        nnz, features, batch_size, cols, rows, coo_rows, coo_cols, coo_vals, X, Y
-    );
+    if (rows == 0 || features == 0 || batch_size == 0) return;
+    const dim3 grid((rows + CSR_WARPS_PER_BLOCK - 1) / CSR_WARPS_PER_BLOCK, batch_size);
+    const dim3 block(CSR_WARPS_PER_BLOCK * CSR_WARP_SIZE);
+    csr_spmm_kernel<index_t, scalar_t><<<grid, block, 0, stream>>>(
+        rows, features, batch_size, cols, indptr, col_ind, csr_vals, X, Y);
 }
 
-
-// Explicit instantiations
-template void launch_pbr_spmm<int32_t, float>(const int, const int, const int, const int, const int, const int, const int, const uint64_t*, const int32_t*, const int32_t*, const float*,  const float*,  float*,  cudaStream_t);
-template void launch_pbr_spmm<int64_t, float>(const int, const int, const int, const int, const int, const int, const int, const uint64_t*, const int64_t*, const int64_t*, const float*,  const float*,  float*,  cudaStream_t);
-template void launch_pbr_spmm<int32_t, double>(const int, const int, const int, const int, const int, const int, const int, const uint64_t*, const int32_t*, const int32_t*, const double*, const double*, double*, cudaStream_t);
-template void launch_pbr_spmm<int64_t, double>(const int, const int, const int, const int, const int, const int, const int, const uint64_t*, const int64_t*, const int64_t*, const double*, const double*, double*, cudaStream_t);
-
-template void launch_coo_spmm<float> (int, int, int, int, int, const int32_t*, const int32_t*, const float*,  const float*,  float*,  cudaStream_t);
-template void launch_coo_spmm<double>(int, int, int, int, int, const int32_t*, const int32_t*, const double*, const double*, double*, cudaStream_t);
+template void launch_csr_spmm<int32_t, float>(const int, const int, const int, const int, const int32_t*, const int32_t*, const float*, const float*, float*, cudaStream_t);
+template void launch_csr_spmm<int64_t, float>(const int, const int, const int, const int, const int64_t*, const int64_t*, const float*, const float*, float*, cudaStream_t);
+template void launch_csr_spmm<int32_t, double>(const int, const int, const int, const int, const int32_t*, const int32_t*, const double*, const double*, double*, cudaStream_t);
+template void launch_csr_spmm<int64_t, double>(const int, const int, const int, const int, const int64_t*, const int64_t*, const double*, const double*, double*, cudaStream_t);

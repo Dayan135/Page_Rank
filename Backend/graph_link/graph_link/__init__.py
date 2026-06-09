@@ -38,20 +38,21 @@ def _pbr_to_method(self, device='cuda'):
 
     # 3. Handle GPU transfer for the NEW object
     if target_device != 'cpu':
-        meta = self.to_dict()
+        # Block fields + CSR remainder (remainder_indptr has size rows+1; an
+        # empty remainder is an all-zero indptr with empty col_ind / vals).
         gpu_meta = {
-            'codes':    torch.as_tensor(meta['block_codes'],   device=device, dtype=torch.int64),
-            'coords':   torch.as_tensor(meta['block_coords'],  device=device, dtype=torch.int32),
-            'offsets':  torch.as_tensor(meta['block_offsets'], device=device, dtype=torch.int32),
-            'data':     torch.as_tensor(meta['block_data'],    device=device),
-            'rem_rows': torch.as_tensor(meta['rem_rows'],      device=device, dtype=torch.int32),
-            'rem_cols': torch.as_tensor(meta['rem_cols'],      device=device, dtype=torch.int32),
-            'rem_vals': torch.as_tensor(meta['rem_vals'],      device=device),
+            'codes':       torch.as_tensor(self.block_codes,        device=device, dtype=torch.int64),
+            'coords':      torch.as_tensor(self.block_coords,       device=device, dtype=torch.int32),
+            'offsets':     torch.as_tensor(self.block_offsets,      device=device, dtype=torch.int32),
+            'data':        torch.as_tensor(self.block_data,         device=device),
+            'rem_indptr':  torch.as_tensor(self.remainder_indptr,   device=device, dtype=torch.int32),
+            'rem_col_ind': torch.as_tensor(self.remainder_col_ind,  device=device, dtype=torch.int32),
+            'rem_vals':    torch.as_tensor(self.remainder_data,     device=device),
         }
-        
+
         # Register the GPU tensors under the new object's ID
         set_pbr_gpu_meta(new_pbr, gpu_meta)
-        
+
     return new_pbr
 
 
@@ -62,10 +63,12 @@ for cls_name in ["PBRMatrixInt64Float", "PBRMatrixInt32Float",
         setattr(getattr(core, cls_name), "to", _pbr_to_method)
         
     
-def pbr_batched_matmul_cuda(pbr_mat, x: torch.Tensor, y: torch.Tensor, batch_size: int, features: int):
+def pbr_batched_matmul_cuda(pbr_mat, x: torch.Tensor) -> torch.Tensor:
     """
-    Launches block SpMM and COO remainder SpMM on two CUDA streams in parallel,
-    then synchronizes via the combined C++ wrapper.
+    Launches the PBR block SpMM and the CSR remainder SpMM on two CUDA streams
+    in parallel via the combined C++ dispatch, which allocates and returns
+    Y = A @ x with shape [batch, rows, features]. Callers squeeze the batch dim
+    for 2D inputs.
     """
     meta = get_pbr_gpu_meta(pbr_mat)
     if meta is None:
@@ -73,19 +76,16 @@ def pbr_batched_matmul_cuda(pbr_mat, x: torch.Tensor, y: torch.Tensor, batch_siz
     index_dtype = meta['coords'].dtype
     data_dtype  = meta['data'].dtype
     if index_dtype == torch.int32 and data_dtype == torch.float32:
-        kernel_func = core.pbr_full_spmm_cuda_int32_float
+        kernel_func = core.pbr_spmm_cuda_i32_f32
     elif index_dtype == torch.int64 and data_dtype == torch.float32:
-        kernel_func = core.pbr_full_spmm_cuda_int64_float
+        kernel_func = core.pbr_spmm_cuda_i64_f32
     elif index_dtype == torch.int32 and data_dtype == torch.float64:
-        kernel_func = core.pbr_full_spmm_cuda_int32_double
+        kernel_func = core.pbr_spmm_cuda_i32_f64
     elif index_dtype == torch.int64 and data_dtype == torch.float64:
-        kernel_func = core.pbr_full_spmm_cuda_int64_double
+        kernel_func = core.pbr_spmm_cuda_i64_f64
     else:
         raise TypeError(f"Unsupported dtype combination: index={index_dtype}, data={data_dtype}")
-    kernel_func(
-        pbr_mat.accounted_blocks(),
-        features,
-        batch_size,
+    return kernel_func(
         pbr_mat.cols,
         pbr_mat.rows,
         pbr_mat.block_rows,
@@ -94,14 +94,12 @@ def pbr_batched_matmul_cuda(pbr_mat, x: torch.Tensor, y: torch.Tensor, batch_siz
         meta['coords'],
         meta['offsets'],
         meta['data'],
-        pbr_mat.remainder_nnz(),
-        meta['rem_rows'],
-        meta['rem_cols'],
+        meta['rem_indptr'],
+        meta['rem_col_ind'],
         meta['rem_vals'],
         x,
-        y
     )
-    
+
 
 def pbr_matmul(pbr_mat, x: torch.Tensor):
     """
@@ -123,30 +121,16 @@ def pbr_matmul(pbr_mat, x: torch.Tensor):
         if meta is None:
             # First-time use: trigger the injected .to() method
             pbr_mat = pbr_mat.to(x.device)
-        
-        # Allocate Y with the exact same dimensionality as X
-        if x.dim() == 2:
-            y = torch.zeros((pbr_mat.rows, width), dtype=x.dtype, device=x.device)
-        else:
-            y = torch.zeros((batch, pbr_mat.rows, width), dtype=x.dtype, device=x.device)
-        
-        # Invoke Native CUDA C++ Kernel
-        pbr_batched_matmul_cuda(pbr_mat, x, y, batch, width)
-        
+
+        # Dispatch allocates and returns Y = [batch, rows, width]
+        y = pbr_batched_matmul_cuda(pbr_mat, x)
+
         return y.squeeze(0) if x.dim() == 2 else y
-        
-    
+
     # 3. CPU Logic (no cuda!)
-    y = torch.zeros((batch, pbr_mat.rows, width), dtype=x.dtype, device='cpu')
-    
-    core.pbr_batched_matmul_cpu(
-        pbr_mat, 
-        x.numpy(), 
-        y.numpy(), 
-        batch, 
-        width
-    )
-    
+    # The C++ matmul allocates and returns Y = [batch, rows, width].
+    y = core.pbr_batched_matmul_cpu(pbr_mat, x)
+
     return y.squeeze(0) if x.dim() == 2 else y
 
 
@@ -252,9 +236,8 @@ def run_personalized_pagerank(
     K      = source_nodes.shape[0]
     dtype  = meta['data'].dtype
 
-    # Single X buffer (updated in-place), one Y buffer for SpMM output.
+    # Single X buffer (updated in-place); each SpMM allocates its own Y.
     X      = torch.zeros((N, K), dtype=dtype, device=device)
-    Y      = torch.zeros((N, K), dtype=dtype, device=device)
     errors = torch.zeros(K,      dtype=dtype, device=device)
 
     if dtype == torch.float32:
@@ -267,9 +250,8 @@ def run_personalized_pagerank(
     init_fn(X, source_nodes, N, K)
 
     for t in range(max_iterations):
-        Y.zero_()                                          # clear for atomicAdd
-        pbr_batched_matmul_cuda(pbr_mat, X, Y, 1, K)      # Y = A @ X
-        update_fn(Y, X, source_nodes, alpha, N, K, errors) # X = alpha*Y + (1-alpha)*e_s
+        Y = pbr_batched_matmul_cuda(pbr_mat, X).squeeze(0)  # Y = A @ X, shape [N, K]
+        update_fn(Y, X, source_nodes, alpha, N, K, errors)  # X = alpha*Y + (1-alpha)*e_s
 
         if errors.max().item() < tolerance:
             return X, t + 1, True

@@ -4,46 +4,36 @@
 #include <cmath>
 #include <algorithm>
 
+#include <torch/extension.h>
+
 using std::pair, std::make_pair;
 using std::make_move_iterator, std::move;
 using std::sqrt;
 using std::unordered_map;
 using std::vector;
 
-//bitmap
-// Helper to count bits set in the mask (Replaces bitset.count())
-inline int count_set_bits(uint64_t n) {
-    return __builtin_popcountll(n);
-}
-//bitmap
-// Helper to check a specific bit (Replaces bitset.test())
-inline bool is_bit_set(uint64_t mask, int bit) {
-    return (mask >> bit) & 1ULL;
-}
 
 
 template <typename index_t, typename scalar_t>
-void pbr_batched_matmul_cpu(const pbr_matrix_t<index_t, scalar_t>& pbr_mat,
-                            const py::array_t<scalar_t, py::array::c_style> x,
-                            py::array_t<scalar_t, py::array::c_style> y,
-                            const int batch_size,
-                            const int width) {
-    
-    // Extract pointers and strides from py::array_t
-    const scalar_t* x_ptr = x.data();
-    scalar_t* y_ptr = y.mutable_data();
+at::Tensor pbr_batched_matmul_cpu(const pbr_matrix_t<index_t, scalar_t>& pbr_mat, at::Tensor x) {
+    TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "Expected 2D or 3D input, got ", x.dim(), "D");
+
+    const int batch_size = (x.dim() == 3) ? (int)x.size(0) : 1;
+    const int width      = (int)x.size(-1);
+
+    at::Tensor x3 = (x.dim() == 2) ? x.unsqueeze(0).contiguous() : x.contiguous();
+    at::Tensor y  = at::zeros({batch_size, (int64_t)pbr_mat.rows, (int64_t)width}, x.options());
+
+    const scalar_t* x_ptr = x3.data_ptr<scalar_t>();
+    scalar_t*       y_ptr = y.data_ptr<scalar_t>();
 
     const int x_batch_stride = pbr_mat.cols * width;
     const int y_batch_stride = pbr_mat.rows * width;
 
-    // Initialize output tensor Y to zero
-    std::fill(y_ptr, y_ptr + (batch_size * y_batch_stride), static_cast<scalar_t>(0));
-
     for (int b = 0; b < batch_size; ++b) {
         const scalar_t* curr_x = x_ptr + (b * x_batch_stride);
-        scalar_t* curr_y = y_ptr + (b * y_batch_stride);
+        scalar_t*       curr_y = y_ptr + (b * y_batch_stride);
 
-        // --- Process Compressed Blocks ---
         index_t data_idx = 0;
         for (size_t block_idx = 0; block_idx < pbr_mat.block_codes.size(); ++block_idx) {
             const block_code_t code = pbr_mat.block_codes[block_idx];
@@ -57,24 +47,24 @@ void pbr_batched_matmul_cpu(const pbr_matrix_t<index_t, scalar_t>& pbr_mat,
                     const index_t global_col = coord.col + c;
                     if (global_col >= pbr_mat.cols) continue;
 
-                    if (is_bit_set(code, r * pbr_mat.block_cols + c)) {
+                    if (code.test(r * pbr_mat.block_cols + c)) {
                         const scalar_t val = pbr_mat.block_data[data_idx++];
-                        
-                        for (int w = 0; w < width; ++w) {
+                        for (int w = 0; w < width; ++w)
                             curr_y[global_row * width + w] += val * curr_x[global_col * width + w];
-                        }
                     }
                 }
             }
         }
 
-        // --- Process Remainder COO ---
-        for (const auto& elem : pbr_mat.remainder_coo) {
-            for (int w = 0; w < width; ++w) {
-                curr_y[elem.row * width + w] += elem.val * curr_x[elem.col * width + w];
+        for (index_t r = 0; r < (index_t)pbr_mat.rows; ++r)
+            for (index_t j = pbr_mat.remainder_indptr[r]; j < pbr_mat.remainder_indptr[r + 1]; ++j) {
+                const index_t  c = pbr_mat.remainder_col_ind[j];
+                const scalar_t v = pbr_mat.remainder_vals[j];
+                for (int w = 0; w < width; ++w)
+                    curr_y[r * width + w] += v * curr_x[c * width + w];
             }
-        }
     }
+    return y;
 }
 
 
@@ -103,15 +93,9 @@ void analyze_csr_blocks(const index_t block_rows, const index_t block_cols,
 
             const auto& code = stripe_block_codes.find(block_index);
             if (code == stripe_block_codes.end()) {
-                const index_t bit_index = row_offset * block_cols + col_offset;
-                stripe_block_indices.push_back(block_index);
-                //bitmap
-                stripe_block_codes[block_index] = (1ULL << bit_index); // Bitwise set
-                // stripe_block_codes[block_index].set(bit_index);
+                stripe_block_codes[block_index].set(bit_index);
             } else {
-                //bitmap
-                code->second |= (1ULL << bit_index); // Bitwise OR
-                // code->second.set(bit_index);
+                code->second.set(bit_index);
             }
         }
 
@@ -124,14 +108,12 @@ void analyze_csr_blocks(const index_t block_rows, const index_t block_cols,
                 const index_t block_coord_row = block_index / num_col_blocks * block_rows;
                 const index_t block_coord_col = block_index % num_col_blocks * block_cols;
                 
-                //bitmap
-                const block_code_t block_code = stripe_block_codes[block_index];
-                // const auto& block_code = stripe_block_codes.find(block_index)->second.to_ulong();
+                const index_t block_code_key = (index_t)stripe_block_codes.find(block_index)->second.to_ulong();
 
                 // Record this block code as having been seen once more
                 // and store the coordinates of the block
-                block_stats[block_code].occurrence++;
-                block_stats[block_code].block_coords.push_back({block_coord_row, block_coord_col});
+                block_stats[block_code_key].occurrence++;
+                block_stats[block_code_key].block_coords.push_back({block_coord_row, block_coord_col});
             }
 
             stripe_block_codes.clear();
@@ -322,23 +304,24 @@ void pbr_to_csr(const pbr_matrix_t<index_t, scalar_t>& pbr_mat,
         const auto& coord = pbr_mat.block_coords[b];
         for (index_t r = 0; r < pbr_mat.block_rows; ++r) {
             // Safety check: ensure we don't write past the last row of the matrix
-            if (coord.row + r >= pbr_mat.rows) continue;
+            // If we reached the last block and the matrix dimensions are not perfectly divisible by block size, we might have some "partial" blocks at the edges.
+            if (coord.row + r >= pbr_mat.rows) {
+                throw std::runtime_error("Block coordinate exceeds matrix dimensions. Check block size and matrix dimensions for compatibility.");
+            }
             for (index_t c = 0; c < pbr_mat.block_cols; ++c) {
                 // Safety check: ensure we don't write past the last column
                 if (coord.col + c >= pbr_mat.cols) continue;
                 
-                //bitmap
-                if(is_bit_set(code, r * pbr_mat.block_cols + c)){
-                //if (code.test(r * pbr_mat.block_cols + c)) {
+                if (code.test(r * pbr_mat.block_cols + c)) {
                     row_bins[coord.row + r].push_back({coord.col + c, pbr_mat.block_data[data_idx++]});
                 }
             }
         }
     }
-    // 2. Unpack remainder COO
-    for (const auto& elem : pbr_mat.remainder_coo) {
-        row_bins[elem.row].push_back({elem.col, elem.val});
-    }
+    // 2. Unpack remainder CSR
+    for (index_t r = 0; r < pbr_mat.rows; ++r)
+        for (index_t j = pbr_mat.remainder_indptr[r]; j < pbr_mat.remainder_indptr[r + 1]; ++j)
+            row_bins[r].push_back({pbr_mat.remainder_col_ind[j], pbr_mat.remainder_vals[j]});
     // 3. Write back to CSR format
     index_t current_nnz = 0;
     indptr_ptr[0] = 0;
@@ -379,9 +362,10 @@ pbr_matrix_t<index_t, scalar_t> csr_to_pbr(const py::array_t<index_t, py::array:
     vector<scalar_t> block_data;
     block_data.reserve(total_nnz);
 
-    vector<coo_elem_t<index_t,scalar_t>> remainder_coo;
+    // Per-row remainder bins; collapsed to CSR after all stripes are processed.
+    vector<vector<pair<index_t, scalar_t>>> rem_bins(rows);
 
-    // NEW: Offsets vector to track data start positions
+    // Offsets vector to track data start positions
     vector<index_t> block_offsets;
     index_t current_offset = 0;
     block_offsets.push_back(current_offset); // Start of first block
@@ -402,18 +386,13 @@ pbr_matrix_t<index_t, scalar_t> csr_to_pbr(const py::array_t<index_t, py::array:
             const uint64_t block_index = block_row * num_col_blocks + block_col;
             const uint64_t bit_index = row_offset_in_block * block_cols + col_offset_in_block;
 
-            const auto& code_found = stripe_block_codes.emplace(block_index, 0);
+            const auto& code_found = stripe_block_codes.emplace(block_index, block_code_t{});
             auto& code = code_found.first->second;
             if (code_found.second) {
-                //stripe_block_coords.emplace(block_index, coord_t<index_t>(row, col));
-                //update, think that bug was here!
-                //saved the first nnz as the start of the block. changed to the real start
                 stripe_block_coords.emplace(block_index, coord_t<index_t>(block_row * block_rows, block_col * block_cols));
             }
 
-            //bitmap
-            code |= (1ULL << bit_index);
-            // code.set(bit_index);
+            code.set(bit_index);
             stripe_block_data[block_index].emplace_back(data_data[nnz_idx]);
         }
 
@@ -421,12 +400,8 @@ pbr_matrix_t<index_t, scalar_t> csr_to_pbr(const py::array_t<index_t, py::array:
         // If so, decide for each block whether it should be stored in the PBR matrix or in the remainder COO matrix.
         if ((row + 1) / block_rows > block_row) {
             for (const auto& [block_index, code] : stripe_block_codes) {
-                int nnz_in_block = count_set_bits(code);
-                // If the block has more than the minimum number of nonzeros, store it in the PBR matrix.
-                // Otherwise, store the nonzeros in the remainder COO matrix.
-                //bitmap
-                if (count_set_bits(code) >= min_nnz_per_block) {
-                // if (code.count() >= min_nnz_per_block) {
+                int nnz_in_block = (int)code.count();
+                if (nnz_in_block >= min_nnz_per_block) {
                     block_codes.emplace_back(code);
                     block_coords.emplace_back(std::move(stripe_block_coords[block_index]));
                     block_data.insert(block_data.end(), make_move_iterator(stripe_block_data[block_index].begin()),
@@ -436,19 +411,14 @@ pbr_matrix_t<index_t, scalar_t> csr_to_pbr(const py::array_t<index_t, py::array:
                     current_offset += nnz_in_block;
                     block_offsets.push_back(current_offset);
                 } else {
-                    index_t block_nnz_index = 0;
-                    for (index_t row_offset = 0; row_offset < block_rows; ++row_offset) {
-                        for (index_t col_offset = 0; col_offset < block_cols; ++col_offset) {
-                            //bitmap
-                            if (is_bit_set(code, row_offset * block_cols + col_offset)) {
-                            // if (code.test(row_offset * block_cols + col_offset)) {
-                                const auto [block_row, block_col] = stripe_block_coords[block_index];
-                                remainder_coo.emplace_back(block_row + row_offset, block_col + col_offset,
-                                                           stripe_block_data[block_index][block_nnz_index]);
-                                ++block_nnz_index;
-                            }
-                        }
-                    }
+                    const auto [block_row, block_col] = stripe_block_coords[block_index];
+                    index_t k = 0;
+                    for (index_t row_offset = 0; row_offset < block_rows; ++row_offset)
+                        for (index_t col_offset = 0; col_offset < block_cols; ++col_offset)
+                            if (code.test(row_offset * block_cols + col_offset))
+                                rem_bins[block_row + row_offset].emplace_back(
+                                    block_col + col_offset,
+                                    stripe_block_data[block_index][k++]);
                 }
             }
 
@@ -459,9 +429,10 @@ pbr_matrix_t<index_t, scalar_t> csr_to_pbr(const py::array_t<index_t, py::array:
     }
 
     // Flush the last partial stripe when rows % block_rows != 0
+    // (the in-loop stripe boundary never fires for the trailing partial stripe).
     for (const auto& [block_index, code] : stripe_block_codes) {
-        int nnz_in_block = count_set_bits(code);
-        if (count_set_bits(code) >= min_nnz_per_block) {
+        int nnz_in_block = (int)code.count();
+        if (nnz_in_block >= min_nnz_per_block) {
             block_codes.emplace_back(code);
             block_coords.emplace_back(std::move(stripe_block_coords[block_index]));
             block_data.insert(block_data.end(), make_move_iterator(stripe_block_data[block_index].begin()),
@@ -469,50 +440,46 @@ pbr_matrix_t<index_t, scalar_t> csr_to_pbr(const py::array_t<index_t, py::array:
             current_offset += nnz_in_block;
             block_offsets.push_back(current_offset);
         } else {
-            index_t block_nnz_index = 0;
-            for (index_t row_offset = 0; row_offset < block_rows; ++row_offset) {
-                for (index_t col_offset = 0; col_offset < block_cols; ++col_offset) {
-                    if (is_bit_set(code, row_offset * block_cols + col_offset)) {
-                        const auto [block_row, block_col] = stripe_block_coords[block_index];
-                        remainder_coo.emplace_back(block_row + row_offset, block_col + col_offset,
-                                                   stripe_block_data[block_index][block_nnz_index]);
-                        ++block_nnz_index;
-                    }
-                }
-            }
+            const auto [block_row, block_col] = stripe_block_coords[block_index];
+            index_t k = 0;
+            for (index_t row_offset = 0; row_offset < block_rows; ++row_offset)
+                for (index_t col_offset = 0; col_offset < block_cols; ++col_offset)
+                    if (code.test(row_offset * block_cols + col_offset))
+                        rem_bins[block_row + row_offset].emplace_back(
+                            block_col + col_offset,
+                            stripe_block_data[block_index][k++]);
         }
     }
+
+    // Build CSR remainder from per-row bins
+    vector<index_t> remainder_indptr(rows + 1, 0);
+    for (index_t r = 0; r < rows; ++r) {
+        std::sort(rem_bins[r].begin(), rem_bins[r].end());
+        remainder_indptr[r + 1] = remainder_indptr[r] + (index_t)rem_bins[r].size();
+    }
+    vector<index_t> remainder_col_ind;
+    vector<scalar_t> remainder_vals;
+    remainder_col_ind.reserve(remainder_indptr[rows]);
+    remainder_vals.reserve(remainder_indptr[rows]);
+    for (auto& row : rem_bins)
+        for (auto& [c, v] : row) {
+            remainder_col_ind.push_back(c);
+            remainder_vals.push_back(v);
+        }
 
     return pbr_matrix_t<index_t, scalar_t>(rows, cols, block_rows, block_cols, total_nnz,
                                            std::move(block_codes), std::move(block_coords),
                                            std::move(block_offsets),
                                            data_order_t::BLOCK_ROW_MAJOR, std::move(block_data),
-                                           std::move(remainder_coo));
+                                           std::move(remainder_indptr),
+                                           std::move(remainder_col_ind),
+                                           std::move(remainder_vals));
 }
 
-template void pbr_batched_matmul_cpu<int64_t, float>(const pbr_matrix_t<int64_t, float>& pbr_mat, 
-                                                    const py::array_t<float, py::array::c_style> x, 
-                                                    py::array_t<float, py::array::c_style> y, 
-                                                    const int batch_size, 
-                                                    const int width);
-
-template void pbr_batched_matmul_cpu<int32_t, float>(const pbr_matrix_t<int32_t, float>& pbr_mat, 
-                                                    const py::array_t<float, py::array::c_style> x, 
-                                                    py::array_t<float, py::array::c_style> y, 
-                                                    const int batch_size, 
-                                                    const int width);
-
-template void pbr_batched_matmul_cpu<int64_t, double>(const pbr_matrix_t<int64_t, double>& pbr_mat, 
-                                                     const py::array_t<double, py::array::c_style> x, 
-                                                     py::array_t<double, py::array::c_style> y, 
-                                                     const int batch_size, 
-                                                     const int width);
-
-template void pbr_batched_matmul_cpu<int32_t, double>(const pbr_matrix_t<int32_t, double>& pbr_mat, 
-                                                     const py::array_t<double, py::array::c_style> x, 
-                                                     py::array_t<double, py::array::c_style> y, 
-                                                     const int batch_size, 
-                                                     const int width);
+template at::Tensor pbr_batched_matmul_cpu<int64_t, float>(const pbr_matrix_t<int64_t, float>&, at::Tensor);
+template at::Tensor pbr_batched_matmul_cpu<int32_t, float>(const pbr_matrix_t<int32_t, float>&, at::Tensor);
+template at::Tensor pbr_batched_matmul_cpu<int64_t, double>(const pbr_matrix_t<int64_t, double>&, at::Tensor);
+template at::Tensor pbr_batched_matmul_cpu<int32_t, double>(const pbr_matrix_t<int32_t, double>&, at::Tensor);
 
 
 template pbr_stats_t<uint64_t, float> pbr_analyze_csr(const py::array_t<uint64_t, py::array::c_style> indptr,
