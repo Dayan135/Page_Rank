@@ -75,6 +75,40 @@ def resolve_titles(path: str, wanted_ids: set[int]) -> dict[int, str]:
     return found
 
 
+def torch_ppr(A_norm, seed_idx, N, alpha, max_iter, tol):
+    """Same PPR power iteration via torch.sparse CSR (cuSPARSE SpMM) — the baseline.
+
+    X_{t+1} = alpha * (A @ X_t) + (1-alpha) * e_s, one-hot per seed column, to
+    convergence under the same tolerance. Returns (X, iters, converged, seconds, peak_bytes).
+    """
+    crow = torch.from_numpy(A_norm.indptr.astype(np.int64))
+    col = torch.from_numpy(A_norm.indices.astype(np.int64))
+    val = torch.from_numpy(A_norm.data.astype(np.float32))
+    A = torch.sparse_csr_tensor(crow, col, val, size=(N, N), device="cuda")
+
+    K = len(seed_idx)
+    seeds = torch.tensor(seed_idx, dtype=torch.long, device="cuda")
+    cols = torch.arange(K, device="cuda")
+    X = torch.zeros((N, K), dtype=torch.float32, device="cuda")
+    X[seeds, cols] = 1.0
+
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
+    t0 = time.time()
+    iters, converged = max_iter, False
+    for t in range(max_iter):
+        Y = A @ X                       # cuSPARSE SpMM
+        Xn = alpha * Y
+        Xn[seeds, cols] += (1.0 - alpha)
+        err = (Xn - X).abs().sum(dim=0).max().item()
+        X = Xn
+        if err < tol:
+            iters, converged = t + 1, True
+            break
+    torch.cuda.synchronize()
+    return X, iters, converged, time.time() - t0, torch.cuda.max_memory_allocated()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--graph", required=True, help="path to {lang}wiki.wikilink_graph.*.csv.gz")
@@ -85,6 +119,8 @@ def main() -> None:
     ap.add_argument("--topk", type=int, default=20, help="how many top-ranked articles to print")
     ap.add_argument("--block", type=int, default=8, help="PBR block size")
     ap.add_argument("--min-nnz", type=int, default=1, help="PBR min nnz per block")
+    ap.add_argument("--benchmark-torch", action="store_true",
+                    help="also run the same PPR with torch.sparse (cuSPARSE) and compare")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -143,6 +179,7 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     ppr_s = time.time() - t0
+    gl_peak = torch.cuda.max_memory_allocated()
 
     # Uniform personalization over the seed set = mean of the per-seed columns.
     r = X.mean(dim=1)
@@ -163,12 +200,44 @@ def main() -> None:
     print(f"alpha          : {args.alpha}")
     print(f"iterations     : {iters}  (converged={converged})")
     print(f"ppr wall time  : {ppr_s*1000:.1f} ms  ({ppr_s/max(iters,1)*1000:.2f} ms/iter)")
-    print(f"peak GPU mem   : {torch.cuda.max_memory_allocated()/1e9:.2f} GB")
+    print(f"peak GPU mem   : {gl_peak/1e9:.2f} GB")
     print(f"final L1 error : {history[-1]:.2e}")
     print(f"\nseeds (top out-degree): " + ", ".join(title(i) for i in seed_idx))
     print(f"\ntop {len(top_idx)} articles by personalized rank:")
     for rank, (i, s) in enumerate(zip(top_idx, top_scores), 1):
         print(f"  {rank:2d}. {s:.6e}  {title(i)}")
+
+    if args.benchmark_torch:
+        r_gl = r.detach().cpu()
+        # Free the graph_link GPU state so both engines aren't resident at once.
+        from graph_link.pbr_registry import clear_pbr_gpu_meta
+        clear_pbr_gpu_meta(pbr)
+        del pbr, X, r, top_scores
+        torch.cuda.empty_cache()
+
+        Xt, iters_t, conv_t, s_t, peak_t = torch_ppr(
+            A_norm, seed_idx, N, args.alpha, args.max_iter, args.tol
+        )
+        rt = Xt.mean(dim=1)
+        rt = rt / rt.sum()
+        r_t = rt.detach().cpu()
+        del Xt, rt
+        torch.cuda.empty_cache()
+
+        kk = min(args.topk, N)
+        max_diff = (r_gl - r_t).abs().max().item()
+        overlap = len(set(torch.topk(r_gl, kk).indices.tolist())
+                      & set(torch.topk(r_t, kk).indices.tolist()))
+
+        print("\n=== torch.sparse (cuSPARSE) baseline ===")
+        print(f"iterations     : {iters_t}  (converged={conv_t})")
+        print(f"ppr wall time  : {s_t*1000:.1f} ms  ({s_t/max(iters_t,1)*1000:.2f} ms/iter)")
+        print(f"peak GPU mem   : {peak_t/1e9:.2f} GB")
+        print("\n=== graph_link (PBR) vs torch.sparse ===")
+        print(f"graph_link  : {ppr_s*1000:8.1f} ms  ({iters} it)  {gl_peak/1e9:.2f} GB")
+        print(f"torch.sparse: {s_t*1000:8.1f} ms  ({iters_t} it)  {peak_t/1e9:.2f} GB")
+        print(f"speedup (torch / graph_link): {s_t/ppr_s:.2f}x")
+        print(f"rank parity : max|delta|={max_diff:.2e}, top-{kk} overlap={overlap}/{kk}")
 
 
 if __name__ == "__main__":
