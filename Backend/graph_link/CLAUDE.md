@@ -140,7 +140,7 @@ by `id(pbr_mat)`:
 }
 ```
 
-### `csr_to_pbr(mat, block_rows=8, block_cols=8, min_nnz_per_block=4)`
+### `csr_to_pbr(mat, block_rows=2, block_cols=2, min_nnz_per_block=2)`
 `scipy.sparse.csr_matrix` or a CPU sparse-CSR `torch.Tensor` → `pbr_matrix_t`.
 
 ### `pbr_matmul(pbr_mat, x: Tensor) -> Tensor`

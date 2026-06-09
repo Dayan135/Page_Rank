@@ -131,7 +131,7 @@ def run_ppr(req: PPRRequest) -> dict:
     )
     A_norm = graph_link.normalize_transition_matrix(A)
 
-    pbr = graph_link.csr_to_pbr(A_norm, block_rows=8, block_cols=8, min_nnz_per_block=1).to("cuda")
+    pbr = graph_link.csr_to_pbr(A_norm).to("cuda")  # default block/min_nnz (see graph_link)
     sources = torch.tensor(seed_idx, dtype=torch.int32, device="cuda")
 
     X, iterations, converged, history = graph_link.run_personalized_pagerank(

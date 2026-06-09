@@ -135,8 +135,8 @@ def pbr_matmul(pbr_mat, x: torch.Tensor):
 
 
 def csr_to_pbr(mat: sp.csr_matrix | torch.Tensor,
-               block_rows: int = 8, block_cols: int = 8,
-               min_nnz_per_block: int = 4):
+               block_rows: int = 2, block_cols: int = 2,
+               min_nnz_per_block: int = 2):
     if isinstance(mat, torch.Tensor):
         if mat.device.type != 'cpu':
             raise ValueError('Input tensor must be on CPU')

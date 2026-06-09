@@ -117,8 +117,8 @@ def main() -> None:
     ap.add_argument("--max-iter", type=int, default=100)
     ap.add_argument("--tol", type=float, default=1e-6)
     ap.add_argument("--topk", type=int, default=20, help="how many top-ranked articles to print")
-    ap.add_argument("--block", type=int, default=8, help="PBR block size")
-    ap.add_argument("--min-nnz", type=int, default=1, help="PBR min nnz per block")
+    ap.add_argument("--block", type=int, default=2, help="PBR block size")
+    ap.add_argument("--min-nnz", type=int, default=2, help="PBR min nnz per block")
     ap.add_argument("--benchmark-torch", action="store_true",
                     help="also run the same PPR with torch.sparse (cuSPARSE) and compare")
     args = ap.parse_args()
