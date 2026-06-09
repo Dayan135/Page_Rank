@@ -60,6 +60,31 @@ python Tests/benchmark_spdmm.py [--wandb]
 
 All tests require a CUDA-capable GPU.
 
+## Running the PPR server (GPU cluster)
+
+The FastAPI server needs CUDA, so it runs as a long-running Slurm job on a GPU
+node; a laptop reaches it through an SSH tunnel via the login node. Verified flow:
+
+1. **One-time deps** — from the **login node** (compute nodes have no internet):
+   `conda activate pageRank_312 && pip install fastapi 'uvicorn[standard]'`.
+2. **Start the server** — submit a long job that runs uvicorn on a pinned RTX 3090.
+   In the job: `module load cuda/12.5`, set `CUDA_HOME`/`LD_LIBRARY_PATH`/`PYTHONPATH`
+   (see [`Backend/server/README.md`](Backend/server/README.md)), then
+   `cd Backend/server && uvicorn app:app --host 0.0.0.0 --port 8000`.
+   sbatch header: `--partition=rtx3090 --account=erant --qos=normal --gres=gpu:rtx_3090:1 --time=02:00:00`.
+   The job logs its node; `squeue -u dayanb -j <id> -o %N` also shows it.
+3. **Tunnel** from the laptop (compute nodes aren't directly SSH-able; the login
+   node forwards to `<node>:8000` over the internal network):
+   `ssh -N -L 8000:<node>:8000 dayanb@slurm.bgu.ac.il`.
+4. **Client** — `cd Frontend && npm run dev`, open http://localhost:5173 (Vite
+   proxies `/api` → localhost:8000 → tunnel → server).
+5. **Stop** — `ssh dayanb@slurm.bgu.ac.il scancel <id>`, then close the tunnel and
+   dev server.
+
+If the server restarts on a different node, re-point the tunnel. **After any
+cluster `git pull`** (which restores the stale tracked `.so`), rebuild before
+serving: `rm -rf Backend/graph_link/build Backend/graph_link/graph_link_core*.so && pip install -e Backend/graph_link/ --no-build-isolation`.
+
 ## Key files to know
 
 | Path | Purpose |

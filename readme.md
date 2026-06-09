@@ -9,6 +9,11 @@ kernel mops up the nonzeros that don't fit the block pattern.
 The repo ships the kernels, a Python API, an HTTP service, and a React app that
 lets you upload a graph, run PPR on the GPU, and explore the results.
 
+> ⚠️ **An NVIDIA GPU (CUDA) is required to run.** The backend builds and executes
+> custom CUDA kernels — there is no CPU-only fallback for the server, and building
+> or running it without an NVIDIA GPU will fail. (The frontend's in-browser mock
+> needs no GPU, but it is not the real engine.)
+
 ## Architecture
 
 ```
@@ -30,9 +35,10 @@ The PBR SpMM path is **manually synced** from the research repo
 
 ## Requirements
 
-A CUDA GPU is required to build/run the backend (compilation and tests fail
-without one). On the BGU cluster, CUDA comes from the module system — see
-[`CLAUDE.md`](CLAUDE.md) for the exact environment.
+An **NVIDIA GPU with CUDA** is required to build and run the backend — compilation
+and tests fail without one. On the BGU cluster, CUDA comes from the module system
+(`module load cuda/12.5`) — see [`CLAUDE.md`](CLAUDE.md) for the exact environment
+and the [server run guide](CLAUDE.md#running-the-ppr-server-gpu-cluster).
 
 ## Quick start
 
