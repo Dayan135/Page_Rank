@@ -1,6 +1,6 @@
 export type NodeId = string;
 
-export type CSVFormat = "edge" | "coo" | "adjacency";
+export type CSVFormat = "edge" | "coo" | "adjacency" | "custom-edge-list";
 
 export interface GraphNode {
   id: NodeId;
@@ -17,6 +17,7 @@ export interface Graph {
   edges: GraphEdge[];
   format: CSVFormat;
   warnings: string[];
+  labels?: Record<NodeId, string>;
 }
 
 export interface PPRParams {

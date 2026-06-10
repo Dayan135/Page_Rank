@@ -19,6 +19,7 @@ interface Row {
 
 export function RanksTable() {
   const result = useAppStore((s) => s.result);
+  const labels = useAppStore((s) => s.graph?.labels);
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("rank");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
@@ -39,7 +40,13 @@ export function RanksTable() {
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const base = q ? rows.filter((r) => r.id.toLowerCase().includes(q)) : rows;
+    const base = q
+      ? rows.filter(
+          (r) =>
+            r.id.toLowerCase().includes(q) ||
+            (labels?.[r.id] ?? "").toLowerCase().includes(q),
+        )
+      : rows;
     const sorted = [...base].sort((a, b) => {
       const av = a[sortKey];
       const bv = b[sortKey];
@@ -77,7 +84,7 @@ export function RanksTable() {
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-3">
         <Input
-          placeholder="Search node ID…"
+          placeholder={labels ? "Search node ID or name…" : "Search node ID…"}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           className="max-w-sm"
@@ -97,6 +104,7 @@ export function RanksTable() {
                 <SortHeader k="id" current={sortKey} dir={sortDir} onClick={toggleSort}>
                   Node <Icon k="id" />
                 </SortHeader>
+                {labels && <TableHead>Name</TableHead>}
                 <SortHeader k="score" current={sortKey} dir={sortDir} onClick={toggleSort} numeric>
                   Score <Icon k="score" />
                 </SortHeader>
@@ -113,6 +121,9 @@ export function RanksTable() {
                 <TableRow key={r.id}>
                   <TableCell className="font-mono tabular-nums">{r.rank}</TableCell>
                   <TableCell className="font-mono">{r.id}</TableCell>
+                  {labels && (
+                    <TableCell className="max-w-[200px] truncate">{labels[r.id] ?? ""}</TableCell>
+                  )}
                   <TableCell className="text-right font-mono tabular-nums">
                     {formatScore(r.score)}
                   </TableCell>

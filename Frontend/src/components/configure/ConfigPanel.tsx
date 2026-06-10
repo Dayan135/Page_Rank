@@ -59,7 +59,7 @@ export function ConfigPanel() {
           max={graph.nodes.length}
           onChange={(topX) => setParams({ topX })}
         />
-        <SeedNodePicker nodes={graph.nodes} seeds={params.seeds} onChange={setSeeds} />
+        <SeedNodePicker nodes={graph.nodes} seeds={params.seeds} onChange={setSeeds} labels={graph.labels} />
         <Button
           variant="accent"
           size="lg"

@@ -29,6 +29,12 @@ const FORMATS: FormatOption[] = [
     description: "N×N grid, first row & col are node labels.",
     example: ",A,B,C\nA,0,1,0.5\nB,0,0,1\nC,1,0,0",
   },
+  {
+    value: "custom-edge-list",
+    title: "Custom edge list",
+    description: "Any CSV/TSV edge list — you map columns after uploading.",
+    example: "page_id_from,page_id_to,page_title_from\n1,2,Cat\n2,3,Animal\n3,1,Life",
+  },
 ];
 
 interface FormatPickerProps {
@@ -41,7 +47,7 @@ export function FormatPicker({ value, onChange }: FormatPickerProps) {
     <RadioGroup
       value={value ?? ""}
       onValueChange={(v) => onChange(v as CSVFormat)}
-      className="grid gap-3 sm:grid-cols-3"
+      className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"
       aria-label="Choose a CSV format"
     >
       {FORMATS.map((opt) => {

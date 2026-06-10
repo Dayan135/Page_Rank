@@ -13,7 +13,7 @@ export function ExportMenu() {
   if (!graph || !result) return null;
 
   const downloadCSV = () => {
-    const csv = resultToCSV(result);
+    const csv = resultToCSV(result, graph.labels);
     saveAs(new Blob([csv], { type: "text/csv;charset=utf-8" }), "ppr-results.csv");
   };
 

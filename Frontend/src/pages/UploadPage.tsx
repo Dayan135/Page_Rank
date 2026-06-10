@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { CheckCircle2, ArrowRight, RefreshCw } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -5,15 +6,24 @@ import { Button } from "@/components/ui/button";
 import { FormatPicker } from "@/components/upload/FormatPicker";
 import { FileDropzone } from "@/components/upload/FileDropzone";
 import { SampleGraphPicker } from "@/components/upload/SampleGraphPicker";
+import { ColumnMapper } from "@/components/upload/ColumnMapper";
 import { useAppStore } from "@/store/useAppStore";
 import { parseGraphCSV } from "@/lib/csv";
+import { parseCustom } from "@/lib/csv/parseCustom";
+import type { CustomMapping } from "@/lib/csv/parseCustom";
 import { toast } from "@/components/ui/use-toast";
+import Papa from "papaparse";
 
 const FORMAT_LABEL: Record<string, string> = {
   edge: "Edge list",
   coo: "COO triplets",
   adjacency: "Adjacency matrix",
+  "custom-edge-list": "Custom edge list",
 };
+
+type MappingStage =
+  | { kind: "idle" }
+  | { kind: "mapping"; headers: string[]; previewRows: Record<string, string>[]; rawText: string; fileName: string };
 
 export default function UploadPage() {
   const navigate = useNavigate();
@@ -24,7 +34,35 @@ export default function UploadPage() {
   const setGraph = useAppStore((s) => s.setGraph);
   const setRunStatus = useAppStore((s) => s.setRunStatus);
 
+  const [mappingStage, setMappingStage] = useState<MappingStage>({ kind: "idle" });
+
+  useEffect(() => {
+    setMappingStage({ kind: "idle" });
+  }, [format]);
+
   const handleText = async (text: string, fmt: NonNullable<typeof format>, name?: string) => {
+    if (fmt === "custom-edge-list") {
+      const parsed = Papa.parse<Record<string, string>>(text, {
+        header: true,
+        preview: 50,
+        skipEmptyLines: true,
+        dynamicTyping: false,
+        delimiter: "",
+        transformHeader: (h) => h.trim(),
+      });
+      if (parsed.errors.length > 0 && parsed.data.length === 0) {
+        toast({ title: "Could not read file", description: parsed.errors[0].message, variant: "destructive" });
+        return;
+      }
+      const headers = parsed.meta.fields ?? [];
+      if (headers.length === 0) {
+        toast({ title: "Could not read file", description: "No header row found.", variant: "destructive" });
+        return;
+      }
+      setMappingStage({ kind: "mapping", headers, previewRows: parsed.data, rawText: text, fileName: name ?? "" });
+      return;
+    }
+
     try {
       setRunStatus("parsing");
       const g = await parseGraphCSV(text, fmt);
@@ -44,7 +82,42 @@ export default function UploadPage() {
     }
   };
 
+  const handleCustomImport = async (mapping: CustomMapping) => {
+    if (mappingStage.kind !== "mapping") return;
+    const { rawText, fileName: name } = mappingStage;
+    try {
+      setRunStatus("parsing");
+      const parsed = Papa.parse<Record<string, string>>(rawText, {
+        header: true,
+        skipEmptyLines: true,
+        dynamicTyping: false,
+        delimiter: "",
+        transformHeader: (h) => h.trim(),
+      });
+      if (parsed.errors.length > 0 && parsed.data.length === 0) {
+        throw new Error(parsed.errors[0].message);
+      }
+      const headers = parsed.meta.fields ?? [];
+      const g = parseCustom(parsed.data, headers, mapping);
+      setGraph(g, name);
+      setRunStatus("idle");
+      setMappingStage({ kind: "idle" });
+      if (g.warnings.length > 0) {
+        toast({
+          title: `Parsed with ${g.warnings.length} warning${g.warnings.length === 1 ? "" : "s"}`,
+          description: g.warnings.slice(0, 3).join(" · "),
+        });
+      }
+      navigate("/configure");
+    } catch (err) {
+      setRunStatus("idle");
+      const message = err instanceof Error ? err.message : String(err);
+      toast({ title: "Could not parse file", description: message, variant: "destructive" });
+    }
+  };
+
   const handleReupload = () => {
+    setMappingStage({ kind: "idle" });
     setGraph({ nodes: [], edges: [], format: format ?? "edge", warnings: [] });
   };
 
@@ -108,27 +181,41 @@ export default function UploadPage() {
         <CardHeader>
           <CardTitle className="text-lg">2. Upload file</CardTitle>
           <CardDescription>
-            {format ? "Drop your CSV, or click to browse." : "Pick a format above to enable upload."}
+            {format === "custom-edge-list" && mappingStage.kind === "mapping"
+              ? "Map columns to their roles, then click Import."
+              : format
+                ? "Drop your CSV or TSV, or click to browse."
+                : "Pick a format above to enable upload."}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <FileDropzone
-            disabled={!format}
-            onFile={async (file) => {
-              if (!format) return;
-              const text = await file.text();
-              handleText(text, format, file.name);
-            }}
-            onError={(message) =>
-              toast({ title: "File rejected", description: message, variant: "destructive" })
-            }
-          />
-          <SampleGraphPicker
-            onLoad={({ text, format: f, name }) => {
-              setFormat(f);
-              handleText(text, f, name);
-            }}
-          />
+          {mappingStage.kind === "mapping" ? (
+            <ColumnMapper
+              headers={mappingStage.headers}
+              previewRows={mappingStage.previewRows}
+              onImport={handleCustomImport}
+            />
+          ) : (
+            <>
+              <FileDropzone
+                disabled={!format}
+                onFile={async (file) => {
+                  if (!format) return;
+                  const text = await file.text();
+                  handleText(text, format, file.name);
+                }}
+                onError={(message) =>
+                  toast({ title: "File rejected", description: message, variant: "destructive" })
+                }
+              />
+              <SampleGraphPicker
+                onLoad={({ text, format: f, name }) => {
+                  setFormat(f);
+                  handleText(text, f, name);
+                }}
+              />
+            </>
+          )}
         </CardContent>
       </Card>
 
