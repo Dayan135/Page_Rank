@@ -12,11 +12,27 @@ interface SeedNodePickerProps {
   nodes: { id: NodeId }[];
   seeds: NodeId[];
   onChange: (seeds: NodeId[]) => void;
+  labels?: Record<NodeId, string>;
 }
 
-export function SeedNodePicker({ nodes, seeds, onChange }: SeedNodePickerProps) {
+const MAX_SHOWN = 100;
+
+export function SeedNodePicker({ nodes, seeds, onChange, labels }: SeedNodePickerProps) {
   const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
   const seedSet = useMemo(() => new Set(seeds), [seeds]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const matches = q
+      ? nodes.filter(
+          (n) =>
+            n.id.toLowerCase().includes(q) ||
+            (labels?.[n.id] ?? "").toLowerCase().includes(q),
+        )
+      : nodes;
+    return { shown: matches.slice(0, MAX_SHOWN), total: matches.length };
+  }, [nodes, labels, query]);
 
   const toggle = (id: NodeId) => {
     if (seedSet.has(id)) {
@@ -59,7 +75,13 @@ export function SeedNodePicker({ nodes, seeds, onChange }: SeedNodePickerProps) 
           </Button>
         )}
       </div>
-      <Popover open={open} onOpenChange={setOpen}>
+      <Popover
+        open={open}
+        onOpenChange={(o) => {
+          setOpen(o);
+          if (!o) setQuery("");
+        }}
+      >
         <PopoverTrigger asChild>
           <Button
             variant="outline"
@@ -76,46 +98,66 @@ export function SeedNodePicker({ nodes, seeds, onChange }: SeedNodePickerProps) 
           </Button>
         </PopoverTrigger>
         <PopoverContent className="w-[--radix-popover-trigger-width] p-0" align="start">
-          <Command>
-            <CommandInput placeholder="Search nodes…" />
+          <Command shouldFilter={false}>
+            <CommandInput
+              placeholder={labels ? "Search by name or ID…" : "Search by node ID…"}
+              value={query}
+              onValueChange={setQuery}
+            />
             <CommandList>
               <CommandEmpty>No nodes match.</CommandEmpty>
               <CommandGroup>
-                {nodes.map((n) => {
+                {filtered.shown.map((n) => {
                   const selected = seedSet.has(n.id);
+                  const label = labels?.[n.id];
                   return (
                     <CommandItem
                       key={n.id}
-                      value={n.id}
+                      value={label ? `${label} ${n.id}` : n.id}
                       onSelect={() => toggle(n.id)}
                       aria-selected={selected}
                     >
                       <Check
                         className={cn("mr-2 h-4 w-4", selected ? "opacity-100" : "opacity-0")}
                       />
-                      <span className="font-mono text-xs">{n.id}</span>
+                      {label ? (
+                        <span className="flex flex-col">
+                          <span className="text-sm">{label}</span>
+                          <span className="font-mono text-xs text-muted-foreground">{n.id}</span>
+                        </span>
+                      ) : (
+                        <span className="font-mono text-xs">{n.id}</span>
+                      )}
                     </CommandItem>
                   );
                 })}
               </CommandGroup>
+              {filtered.total > MAX_SHOWN && (
+                <div className="border-t bg-muted/30 p-2 text-center text-xs text-muted-foreground">
+                  Showing {MAX_SHOWN} of {filtered.total.toLocaleString()} matches — type to narrow.
+                </div>
+              )}
             </CommandList>
           </Command>
         </PopoverContent>
       </Popover>
       {seeds.length > 0 && (
         <div className="flex flex-wrap gap-1.5">
-          {seeds.map((s) => (
-            <button
-              key={s}
-              type="button"
-              onClick={() => toggle(s)}
-              className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-0.5 font-mono text-xs hover:bg-muted/70"
-              aria-label={`Remove seed ${s}`}
-            >
-              {s}
-              <X className="h-3 w-3" />
-            </button>
-          ))}
+          {seeds.map((s) => {
+            const label = labels?.[s];
+            return (
+              <button
+                key={s}
+                type="button"
+                onClick={() => toggle(s)}
+                className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-0.5 text-xs hover:bg-muted/70"
+                aria-label={`Remove seed ${s}`}
+              >
+                <span className={label ? "" : "font-mono"}>{label ?? s}</span>
+                <X className="h-3 w-3" />
+              </button>
+            );
+          })}
         </div>
       )}
       <p className="text-xs text-muted-foreground">
