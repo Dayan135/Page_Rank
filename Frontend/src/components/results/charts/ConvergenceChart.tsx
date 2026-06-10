@@ -1,6 +1,7 @@
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useAppStore } from "@/store/useAppStore";
+import { ChartInfo } from "./ChartInfo";
 
 const PRIMARY = "hsl(226 71% 40%)";
 
@@ -16,7 +17,16 @@ export function ConvergenceChart() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-base">Convergence</CardTitle>
+        <div className="flex items-center gap-1.5">
+          <CardTitle className="text-base">Convergence</CardTitle>
+          <ChartInfo label="What is the convergence chart?">
+            How fast the power iteration settles. Each point is the L₁ residual — the total
+            absolute change of the rank vector in that iteration (max over seed columns), on a
+            log scale. Each step contracts the error by roughly α, so a healthy run is a
+            straight descending line that stops when it drops below the tolerance. A flat or
+            rising curve means the run did not converge — treat the scores with suspicion.
+          </ChartInfo>
+        </div>
         <p className="text-xs text-muted-foreground">
           L₁ residual per iteration (log scale). {result.iterations} iter ·{" "}
           {result.converged ? "converged" : "max iter reached"}.

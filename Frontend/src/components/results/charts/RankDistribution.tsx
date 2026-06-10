@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useAppStore } from "@/store/useAppStore";
+import { ChartInfo } from "./ChartInfo";
 
 const ACCENT = "hsl(31 90% 44%)";
 const PRIMARY = "hsl(226 71% 40%)";
@@ -21,7 +22,15 @@ export function RankDistribution() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-base">Rank distribution (top 30)</CardTitle>
+        <div className="flex items-center gap-1.5">
+          <CardTitle className="text-base">Rank distribution (top 30)</CardTitle>
+          <ChartInfo label="What is the rank distribution chart?">
+            The 30 highest PPR scores, largest first. Scores are probabilities (they sum to 1
+            over all nodes): each is the share of time a random surfer spends on that node when
+            restarts always jump back to your seed nodes. A steep drop-off means rank is
+            concentrated near the seeds; a flat profile means it spreads widely.
+          </ChartInfo>
+        </div>
       </CardHeader>
       <CardContent className="h-80">
         <ResponsiveContainer width="100%" height="100%">

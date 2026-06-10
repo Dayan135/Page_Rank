@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useAppStore } from "@/store/useAppStore";
+import { ChartInfo } from "./ChartInfo";
 
 const PRIMARY = "hsl(226 71% 40%)";
 const ACCENT = "hsl(31 90% 44%)";
@@ -29,7 +30,16 @@ export function DegreeHistogram() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-base">Degree distribution</CardTitle>
+        <div className="flex items-center gap-1.5">
+          <CardTitle className="text-base">Degree distribution</CardTitle>
+          <ChartInfo label="What is the degree distribution chart?">
+            How connectivity is spread across the graph. For each degree value on the x-axis,
+            the bars count nodes with that many incoming links (in-degree) and outgoing links
+            (out-degree). Real-world graphs are typically heavy-tailed: most nodes have few
+            links and a small set of hubs has many. Nodes at out-degree 0 are dangling — their
+            PageRank mass is redistributed uniformly. Only the first 30 degree values are shown.
+          </ChartInfo>
+        </div>
         <p className="text-xs text-muted-foreground">
           Number of nodes at each in- and out-degree.
         </p>
