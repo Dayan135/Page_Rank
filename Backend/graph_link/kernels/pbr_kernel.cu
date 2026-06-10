@@ -79,9 +79,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_zero_idle_kern
     }
 
     // --- 2. DYNAMIC P CALCULATION ---
-    // p is floored to a power of 2 so inner-loop /current_p and %current_p
-    // become bit-shift and mask ops.  Correct when features is a power-of-2
-    // multiple of p, which holds for all benchmarked feature counts.
+    // p is floored to a power of 2 so inner-loop /p and %p become bit-shift
+    // and mask ops. The shared buffers always use stride p; in the tail chunk
+    // (features not a multiple of p) lanes past valid_p load as 0 and are
+    // skipped at commit, so any feature count is handled.
     const uint32_t p_log2 = 31u - __clz(min(TOTAL_SHARED / (n_r + n_c), features));
     const uint32_t p      = 1u << p_log2;
     const uint32_t p_mask = p - 1u;
@@ -92,25 +93,27 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_zero_idle_kern
     // --- 3. GRID-STRIDE LOOP OVER FEATURES ---
     for (uint32_t base_f = feat_start; base_f < feat_end; base_f += p) {
 
-        const uint32_t current_p = min(p, feat_end - base_f);
+        const uint32_t valid_p = min(p, feat_end - base_f);
 
         scalar_t* smem_X = smem;
-        scalar_t* smem_Y = smem + (n_c * current_p);
+        scalar_t* smem_Y = smem + (n_c * p);
 
-        // STEP A: Cooperative Load
-        const uint32_t total_x_elements = n_c * current_p;
+        // STEP A: Cooperative Load (lanes beyond valid_p are zero-filled)
+        const uint32_t total_x_elements = n_c * p;
         for (uint32_t i = tx; i < total_x_elements; i += THREADS_PER_BLOCK) {
             const uint32_t c_idx   = i >> p_log2;
             const uint32_t f_offset = i & p_mask;
 
             const uint32_t local_c = (packed_cols_physical >> (c_idx * 3)) & 0x7;
-            smem_X[i] = X[(batch_idx * cols * features) + ((col_origin + local_c) * features) + base_f + f_offset];
+            smem_X[i] = (f_offset < valid_p)
+                ? X[(batch_idx * cols * features) + ((col_origin + local_c) * features) + base_f + f_offset]
+                : scalar_t(0);
         }
 
         __syncthreads();
 
         // STEP B: FLATTENED WORKER POOL
-        const uint32_t total_work = n_r * current_p;
+        const uint32_t total_work = n_r * p;
 
         for (uint32_t work_idx = tx; work_idx < total_work; work_idx += THREADS_PER_BLOCK) {
             const uint32_t pr    = work_idx >> p_log2;
@@ -127,7 +130,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_zero_idle_kern
             for (uint32_t c = 0; c < BLOCK_COLS; ++c) {
                 if ((row_code >> c) & 1) {
                     const uint32_t pc = (packed_cols_logical >> (c * 3)) & 0x7;
-                    sum += __ldg(&block_data[local_data_ptr]) * smem_X[pc * current_p + f_in_s];
+                    sum += __ldg(&block_data[local_data_ptr]) * smem_X[pc * p + f_in_s];
                     local_data_ptr++;
                 }
             }
@@ -137,10 +140,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_zero_idle_kern
 
         __syncthreads();
 
-        // STEP C: Cooperative Atomic Commit
+        // STEP C: Cooperative Atomic Commit (skip zero-padded lanes)
         for (uint32_t work_idx = tx; work_idx < total_work; work_idx += THREADS_PER_BLOCK) {
             const uint32_t pr    = work_idx >> p_log2;
             const uint32_t f_in_s = work_idx & p_mask;
+            if (f_in_s >= valid_p) continue;
 
             const uint32_t actual_r = (packed_active_rows >> (pr * 3)) & 0x7;
             const uint32_t global_r = row_origin + actual_r;
@@ -228,11 +232,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_vec_kernel(
     }
 
     // --- 2. DYNAMIC P CALCULATION (vp floored to power of 2 → bit-op division) ---
-    // vp_log2 / vp_mask replace /vp and %vp in inner loops; correct when
-    // features is a power-of-2 multiple of p (all benchmarked feature counts).
+    // vp_log2 / vp_mask replace /vp and %vp in inner loops. The shared buffers
+    // always use stride p; in the tail chunk (features not a multiple of p)
+    // vectors past valid_vp load as 0 and are skipped at commit. Vectors are
+    // never partially valid: features and FEAT_BLOCK_SIZE are multiples of L.
     const uint32_t vp_log2 = 31u - __clz(min(TOTAL_SHARED / (n_r + n_c), features) / L);
     const uint32_t vp_mask = (1u << vp_log2) - 1u;
-    const uint32_t p       = (1u << vp_log2) * L;
+    const uint32_t vp      = 1u << vp_log2;       // vectors per column (full chunk)
+    const uint32_t p       = vp * L;
 
     const uint32_t feat_start = feat_block_idx * FEAT_BLOCK_SIZE;
     const uint32_t feat_end = min(feat_start + FEAT_BLOCK_SIZE, features);
@@ -240,22 +247,30 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_vec_kernel(
     // --- 3. GRID-STRIDE LOOP OVER FEATURES (in units of L) ---
     for (uint32_t base_f = feat_start; base_f < feat_end; base_f += p) {
 
-        const uint32_t current_p = min(p, feat_end - base_f);  // multiple of L
-        const uint32_t vp = current_p / L;                     // vectors per column
+        const uint32_t valid_vp = min(p, feat_end - base_f) / L;  // valid vectors
 
         scalar_t* smem_X = smem;
-        scalar_t* smem_Y = smem + (n_c * current_p);
+        scalar_t* smem_Y = smem + (n_c * p);
 
-        // STEP A: Cooperative vectorized load of X -> smem_X
+        // STEP A: Cooperative vectorized load of X -> smem_X (zero-fill past valid_vp)
         const uint32_t total_xv = n_c * vp;
         for (uint32_t i = tx; i < total_xv; i += THREADS_PER_BLOCK) {
             const uint32_t c_idx   = i >> vp_log2;
-            const uint32_t f_off   = (i & vp_mask) * L;
+            const uint32_t v_idx   = i & vp_mask;
+            const uint32_t f_off   = v_idx * L;
             const uint32_t local_c = (packed_cols_physical >> (c_idx * 3)) & 0x7;
 
-            const vec_t xv = *reinterpret_cast<const vec_t*>(
-                &X[(batch_idx * cols * features) + ((col_origin + local_c) * features) + base_f + f_off]);
-            *reinterpret_cast<vec_t*>(&smem_X[c_idx * current_p + f_off]) = xv;
+            vec_t xv;
+            if (v_idx < valid_vp) {
+                xv = *reinterpret_cast<const vec_t*>(
+                    &X[(batch_idx * cols * features) + ((col_origin + local_c) * features) + base_f + f_off]);
+            } else {
+                lane_u zero;
+                #pragma unroll
+                for (int l = 0; l < L; ++l) zero.s[l] = 0;
+                xv = zero.v;
+            }
+            *reinterpret_cast<vec_t*>(&smem_X[c_idx * p + f_off]) = xv;
         }
 
         __syncthreads();
@@ -281,7 +296,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_vec_kernel(
                     const scalar_t coef = __ldg(&block_data[local_data_ptr]);
 
                     lane_u xu;
-                    xu.v = *reinterpret_cast<const vec_t*>(&smem_X[pc * current_p + f_off]);
+                    xu.v = *reinterpret_cast<const vec_t*>(&smem_X[pc * p + f_off]);
                     #pragma unroll
                     for (int l = 0; l < L; ++l) acc.s[l] += coef * xu.s[l];
 
@@ -289,21 +304,24 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 16) pbr_spmm_vec_kernel(
                 }
             }
 
-            *reinterpret_cast<vec_t*>(&smem_Y[pr * current_p + f_off]) = acc.v;
+            *reinterpret_cast<vec_t*>(&smem_Y[pr * p + f_off]) = acc.v;
         }
 
         __syncthreads();
 
-        // STEP C: Cooperative atomic commit (vector load from smem, L scalar atomics)
+        // STEP C: Cooperative atomic commit (vector load from smem, L scalar atomics;
+        // zero-padded vectors are skipped)
         for (uint32_t vwork = tx; vwork < total_vwork; vwork += THREADS_PER_BLOCK) {
             const uint32_t pr    = vwork >> vp_log2;
-            const uint32_t f_off = (vwork & vp_mask) * L;
+            const uint32_t v_idx = vwork & vp_mask;
+            if (v_idx >= valid_vp) continue;
+            const uint32_t f_off = v_idx * L;
 
             const uint32_t actual_r = (packed_active_rows >> (pr * 3)) & 0x7;
             const uint32_t global_r = row_origin + actual_r;
 
             lane_u yu;
-            yu.v = *reinterpret_cast<const vec_t*>(&smem_Y[pr * current_p + f_off]);
+            yu.v = *reinterpret_cast<const vec_t*>(&smem_Y[pr * p + f_off]);
             #pragma unroll
             for (int l = 0; l < L; ++l) {
                 atomicAdd(&Y[(batch_idx * rows * features) + (global_r * features) + base_f + f_off + l], yu.s[l]);
