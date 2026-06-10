@@ -43,6 +43,22 @@ All tests require a CUDA-capable GPU. Tests are skipped automatically when CUDA 
 
 **Critical cases**: `min_nnz=4` exercises the CSR remainder kernel heavily, especially for sparse matrices and small block sizes.
 
+### test_spmm_non_pow2_features — feature-loop tail chunk
+
+Regression test for feature counts that are **not** a power-of-2 multiple of the
+kernel's shared-memory partition `p` (the PPR path hits this whenever the seed
+count is 3, 5, 6, …). The kernels process features in chunks of `p`; the last
+chunk can be short, and the short-tail indexing is where the 2026-06 corruption
+bug lived.
+
+| Parameter | Values | Notes |
+|---|---|---|
+| `num_features` | 3, 5, 6, 7, 9, 12 | 12 is a float4-lane multiple → takes the **vectorized** kernel and exercises its tail; the rest take the scalar kernel |
+| `block_size` | 2, 4, 8 | |
+| `min_nnz` | 1, 4 | |
+
+Fixed `N=128`, `density=0.1`, same scipy reference and tolerance as above.
+
 ---
 
 ## test_ppr_accuracy.py — PPR correctness

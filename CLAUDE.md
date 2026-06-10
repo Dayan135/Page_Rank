@@ -44,9 +44,25 @@ export PYTHONPATH=$PYTHONPATH:/home/dayanb/SoftwareProjectPageRank/Backend/graph
 Build + test on the cluster pin an RTX 3090 (`--gres=gpu:rtx_3090:1`, the
 extension is sm_86-only). See the memory note `page-rank-cluster-run-setup`.
 
+## Helper scripts (`scripts/`)
+
+Wrap the common workflows; cluster scripts read the remote path from
+`jobs/.slurm-remote` and SSH to `dayanb@slurm.bgu.ac.il`:
+
+| Script | What it does |
+|---|---|
+| `scripts/test-frontend.sh` | typecheck + Vitest, local, no GPU |
+| `scripts/test-backend.sh` | `srun` pytest (test_spmm + test_ppr_accuracy) on a pinned RTX 3090; `--build` submits the rebuild+test sbatch job instead |
+| `scripts/serve-backend.sh` | submits the server job (or reuses a running one), waits for uvicorn, then holds the SSH tunnel `localhost:8000 → <node>:8000`; `status` / `stop` subcommands |
+| `scripts/run-frontend.sh` | `npm run dev` (installs node_modules if missing) |
+
 ## Running tests
 
 ```bash
+scripts/test-frontend.sh   # frontend, local
+scripts/test-backend.sh    # backend, on the cluster GPU via srun
+
+# Manually on a CUDA host:
 # Correctness (fast, ~5 s)
 pytest Tests/test_spmm.py -v
 pytest Tests/test_ppr_accuracy.py -v
@@ -58,9 +74,13 @@ pytest Tests/test_benchmark.py --benchmark-enable -v
 python Tests/benchmark_spdmm.py [--wandb]
 ```
 
-All tests require a CUDA-capable GPU.
+All backend tests require a CUDA-capable GPU.
 
 ## Running the PPR server (GPU cluster)
+
+**Shortcut:** `scripts/serve-backend.sh` does steps 2–3 below in one command
+(submit or reuse the job, wait for uvicorn, hold the tunnel; `stop` cancels).
+Then `scripts/run-frontend.sh` for step 4.
 
 The FastAPI server needs CUDA, so it runs as a long-running Slurm job on a GPU
 node; a laptop reaches it through an SSH tunnel via the login node. Verified flow:
@@ -94,7 +114,7 @@ serving: `rm -rf Backend/graph_link/build Backend/graph_link/graph_link_core*.so
 | `Backend/graph_link/kernels/pbr_kernels.hpp` | Launcher declarations (`launch_pbr_spmm`, `launch_csr_spmm`) |
 | `Backend/graph_link/bindings/bindings_kernels.cu` | ATen wrappers: `pbr_spmm_cuda_dispatch` (allocates+returns Y, two streams) + PPR wrappers |
 | `Backend/graph_link/graph_link/__init__.py` | High-level Python API (`csr_to_pbr`, `pbr_matmul`, `run_personalized_pagerank`) |
-| `Backend/graph_link/graph_link/pbr_registry.py` | GPU metadata cache keyed by `id(pbr_mat)` |
+| `Backend/graph_link/graph_link/pbr_registry.py` | GPU metadata cache keyed by `id(pbr_mat)`; entries purged via `weakref.finalize` (id reuse in long-lived processes) |
 | `Backend/server/app.py` | FastAPI service (`POST /api/ppr`) wrapping `run_personalized_pagerank` |
 | `Tests/test_benchmark.py` | PPR performance benchmarks (pytest-benchmark) |
 | `Tests/benchmark_spdmm.py` | Standalone SpMM sweep (CUDA events, optional W&B) |
@@ -122,7 +142,7 @@ npm run dev        # http://localhost:5173
 
 ```bash
 npm run build      # production bundle → dist/
-npm run test       # Vitest, all suites (~40 tests)
+npm run test       # Vitest, all suites (~50 tests)
 npm run lint       # ESLint, 0 warnings allowed
 npm run typecheck  # tsc --noEmit
 ```
@@ -132,9 +152,9 @@ npm run typecheck  # tsc --noEmit
 Three-step wizard: **Upload → Configure → Results**, plus a **Learn** page
 explaining the PageRank / PPR math.
 
-1. **Upload** — pick CSV format (edge list / COO triplets / adjacency matrix) then drop a file. Sample graphs in `Frontend/public/samples/` let you try it without a real file.
-2. **Configure** — tune α (damping), max iterations, tolerance, top-X, and seed nodes. **At least one seed is required** (an "i" tooltip explains seeds; Compute is disabled until one is chosen).
-3. **Results** — four tabs: top-ranked node cards, full sortable table, charts (rank distribution, convergence, degree histogram), interactive network graph (React Flow).
+1. **Upload** — pick CSV format (edge list / COO triplets / adjacency matrix / custom edge list) then drop a file. The custom format opens a column mapper: map any CSV/TSV's columns to source, target, and optional label (node name) + weight; auto-detected from common header aliases. Sample graphs in `Frontend/public/samples/` (incl. `enwiki-2002.csv` — English Wikipedia March 2002, 27k nodes / 224k links, WikiLinkGraphs) let you try it without a real file.
+2. **Configure** — tune α (damping), max iterations, tolerance, top-X, and seed nodes. **At least one seed is required** (an "i" tooltip explains seeds; Compute is disabled until one is chosen). The seed picker searches by node ID or label and renders at most 100 matches, so it stays fast on 100k-node graphs.
+3. **Results** — four tabs: top-ranked node cards, full sortable table, charts (rank distribution, convergence, degree histogram — each with an "i" explainer), interactive network graph (React Flow). When the graph has labels, names are shown alongside IDs everywhere (cards, table, CSV export).
 
 ### CSV formats accepted
 
@@ -143,6 +163,7 @@ explaining the PageRank / PPR math.
 | Edge list | `source`, `target` (+ optional `weight`) | as-is from CSV |
 | COO triplets | `row_idx`, `col_idx`, `value` | auto-named `n0`, `n1`, … |
 | Adjacency matrix | header row + row labels | as-is from CSV |
+| Custom edge list | any two columns mapped to source/target (+ optional label, weight); CSV or TSV, delimiter auto-detected | as-is from CSV; labels shown next to IDs |
 
 ### Backend connection
 

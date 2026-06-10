@@ -93,6 +93,14 @@ vestigial — the remainder is CSR, not COO.)
   become shift/mask. `TOTAL_SHARED = 2048`.
 - **`pbr_spmm_vec_kernel<…>`** — vectorized variant: each thread owns `L`
   contiguous features via `float4`/`double2`. Used when `features % L == 0`.
+- **Tail-chunk invariant (both block kernels)**: the feature loop walks chunks
+  of `p`; when `features` is not a multiple of `p` the last chunk is short.
+  Shared buffers are **always laid out with stride `p`** (matching the
+  shift/mask index math); out-of-range lanes are zero-filled on load and
+  skipped at commit. Do not "optimize" the buffers back to the valid width —
+  that desynchronizes loader and consumer and writes past the row in Y
+  (fixed 2026-06; PPR hits this path whenever the seed count is 3, 5, 6, …).
+  Regression coverage: `Tests/test_spmm.py::test_spmm_non_pow2_features`.
 - **`csr_spmm_kernel<index_t, scalar_t>`** — the **CSR remainder** kernel
   (warp-per-row / CSR-Vector). One warp owns a row across all features, loading
   the row's structure once and reusing it across feature tiles. Replaced the old
@@ -126,7 +134,12 @@ The PPR kernels are also bound here (`init_ppr_cuda_*`, `missing_mass_cuda_*`,
 
 ### GPU metadata cache (`pbr_registry.py`)
 `.to('cuda')` reads the matrix's property getters and stores CUDA tensors keyed
-by `id(pbr_mat)`:
+by `id(pbr_mat)`. Because CPython reuses `id()` values after garbage
+collection, every entry is purged via `weakref.finalize` when its matrix dies,
+and `get_pbr_gpu_meta` drops entries whose `rem_indptr` length doesn't match
+`pbr_mat.rows + 1` (stale-hit guard). Without this, a long-lived process (the
+FastAPI server) could silently serve a new matrix with an old matrix's GPU
+tensors. Cached layout:
 
 ```python
 {

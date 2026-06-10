@@ -42,7 +42,27 @@ and the [server run guide](CLAUDE.md#running-the-ppr-server-gpu-cluster).
 
 ## Quick start
 
-### 1. Backend (on a CUDA host)
+### Scripts (BGU cluster workflow)
+
+Day-to-day flow is wrapped in [`scripts/`](scripts/) — they read the remote
+path from `jobs/.slurm-remote` and SSH to the cluster where needed:
+
+```bash
+scripts/serve-backend.sh        # sbatch the PPR server on a GPU node, wait for
+                                #   uvicorn, tunnel localhost:8000 → <node>:8000
+                                #   (also: status | stop)
+scripts/run-frontend.sh         # npm dev server on http://localhost:5173
+scripts/test-frontend.sh        # typecheck + Vitest (local, no GPU)
+scripts/test-backend.sh         # correctness tests on a cluster GPU via srun
+scripts/test-backend.sh --build # full rebuild + tests (after pulling kernel changes)
+```
+
+Typical session: `scripts/serve-backend.sh` in one terminal,
+`scripts/run-frontend.sh` in another, open http://localhost:5173.
+
+### Manual setup (any CUDA host)
+
+#### 1. Backend
 
 ```bash
 # build the CUDA extension into the active conda env (e.g. pageRank_312)
@@ -56,7 +76,7 @@ cd Backend/server && uvicorn app:app --host 0.0.0.0 --port 8000
 
 Health check: `curl localhost:8000/api/health` → `{"status":"ok","cuda":true,...}`.
 
-### 2. Frontend
+#### 2. Frontend
 
 ```bash
 cd Frontend
@@ -84,6 +104,10 @@ network graph. The **Learn** page explains the underlying math.
 ## Tests
 
 ```bash
+scripts/test-frontend.sh                # typecheck + Vitest (local)
+scripts/test-backend.sh                 # SpMM + PPR correctness on a cluster GPU
+
+# or manually, on a CUDA host:
 pytest Tests/test_spmm.py -v            # SpMM vs scipy
 pytest Tests/test_ppr_accuracy.py -v    # PPR vs NetworkX
 cd Frontend && npm run test             # Vitest (frontend)

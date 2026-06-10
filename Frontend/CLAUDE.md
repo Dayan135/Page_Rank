@@ -9,13 +9,26 @@ behind the adapter for tests/offline use.
 
 User flow: `Upload` → `Configure` → `Results` (plus a `Learn` page explaining
 the PageRank / PPR math). The user picks a CSV format (edge list / COO /
-adjacency), drops a file, tunes params (α, maxIter, tolerance, topX, seed
-nodes), and explores PPR results as cards, a table, charts, and a node-link
-graph.
+adjacency / custom edge list), drops a file, tunes params (α, maxIter,
+tolerance, topX, seed nodes), and explores PPR results as cards, a table,
+charts, and a node-link graph.
+
+**Custom edge list** is a two-step flow: dropping a file parses headers + a
+50-row preview (PapaParse `delimiter: ""` auto-detects comma/tab), then
+[`ColumnMapper`](src/components/upload/ColumnMapper.tsx) lets the user map any
+columns to source/target (+ optional label and weight; pre-filled from common
+header aliases like `page_id_from`). Import runs
+[`parseCustom`](src/lib/csv/parseCustom.ts), which also collects
+`Graph.labels` (node ID → display name). When labels exist they're shown next
+to IDs in the seed picker, result cards, table (extra **Name** column,
+searchable), and the CSV export.
 
 **Personalized PageRank requires ≥1 seed.** The seed picker carries an "i"
 info-tooltip explaining what a seed is, and the *Compute PPR* button is disabled
 until at least one seed is selected (the backend also returns `422` if none).
+The picker filters in JS (`shouldFilter={false}`) by node ID **or** label and
+renders at most 100 matches with a "type to narrow" footer — required for
+100k-node graphs (cmdk scoring 100k DOM items froze the tab).
 
 State management is **Zustand**, kept in a single store at [`src/store/useAppStore.ts`](src/store/useAppStore.ts):
 
@@ -50,8 +63,10 @@ so it runs without a server.
 
 | Concern                          | Path                                                      |
 |----------------------------------|-----------------------------------------------------------|
-| CSV parsers (per format)         | [`src/lib/csv/parseEdgeList.ts`](src/lib/csv/parseEdgeList.ts), [`parseCOO.ts`](src/lib/csv/parseCOO.ts), [`parseAdjacency.ts`](src/lib/csv/parseAdjacency.ts) |
-| CSV dispatch entry-point         | [`src/lib/csv/index.ts`](src/lib/csv/index.ts) — `parseGraphCSV(input, format)` |
+| CSV parsers (per format)         | [`src/lib/csv/parseEdgeList.ts`](src/lib/csv/parseEdgeList.ts), [`parseCOO.ts`](src/lib/csv/parseCOO.ts), [`parseAdjacency.ts`](src/lib/csv/parseAdjacency.ts), [`parseCustom.ts`](src/lib/csv/parseCustom.ts) |
+| CSV dispatch entry-point         | [`src/lib/csv/index.ts`](src/lib/csv/index.ts) — `parseGraphCSV(input, format)`; custom format is driven from `UploadPage` instead (mapping is a runtime UI value) |
+| Column mapper (custom format)    | [`src/components/upload/ColumnMapper.tsx`](src/components/upload/ColumnMapper.tsx) — alias auto-detect + 3-row preview |
+| Chart "i" explainers             | [`src/components/results/charts/ChartInfo.tsx`](src/components/results/charts/ChartInfo.tsx) — used by all three charts |
 | PPR algorithm (mock)             | [`src/lib/ppr/computeMockPersonalizedPageRank.ts`](src/lib/ppr/computeMockPersonalizedPageRank.ts) |
 | Algorithm interface + defaults   | [`src/lib/ppr/types.ts`](src/lib/ppr/types.ts) |
 | Adapter (swap-point)             | [`src/lib/ppr/adapter.ts`](src/lib/ppr/adapter.ts) |
@@ -117,6 +132,9 @@ so it runs without a server.
 - **The first cell of an adjacency CSV** may be empty (`,A,B,C`) — the parser allows both empty and a corner label; don't add a check that requires one or the other.
 - **React Flow** needs a fixed-height container (otherwise it renders empty). Don't remove the `h-[560px]` on the card content in `NetworkGraph.tsx`.
 - **The dropzone** is intentionally disabled until a format is picked — don't gate this on a "has any uploaded file" check; the format must come first so error messages are meaningful.
+- **The seed picker must never render the full node list** — it caps at 100 matches with cmdk filtering disabled (`shouldFilter={false}`). Rendering all nodes froze the tab on the 27k-node wiki sample; keep the cap if you touch `SeedNodePicker`.
+- **`Graph.labels` is optional** — every consumer (cards, table, export, seed picker) must fall back to the bare node ID; only the custom edge-list parser produces labels.
+- **Large samples**: `enwiki-2002.csv` (8 MB, 224k edges) is about the ceiling for this UI — the whole graph is serialized to JSON per compute request. Bigger editions go through `Tests/wiki_ppr.py` on the cluster instead.
 
 ## Backend coexistence
 
