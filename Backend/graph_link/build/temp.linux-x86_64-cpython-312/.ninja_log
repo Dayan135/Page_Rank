@@ -1,5 +1,0 @@
-# ninja log v7
-4	2229	1775490259128341012	/home/dayanb/SoftwareProjectPageRank/Backend/graph_link/build/temp.linux-x86_64-cpython-312/kernels/pbr_kernel.o	b2aa39e3fb0ea5f6
-5	8897	1775490259128341012	/home/dayanb/SoftwareProjectPageRank/Backend/graph_link/build/temp.linux-x86_64-cpython-312/pbr_matrix/pbr_matrix.o	6b03592fe3036bef
-1	17530	1775490259124340946	/home/dayanb/SoftwareProjectPageRank/Backend/graph_link/build/temp.linux-x86_64-cpython-312/bindings/bindings.o	cd6066adb6e9e7e8
-3	51950	1775490259128341012	/home/dayanb/SoftwareProjectPageRank/Backend/graph_link/build/temp.linux-x86_64-cpython-312/bindings/bindings_kernels.o	f145f975b91ad846
